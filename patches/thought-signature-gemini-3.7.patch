@@ -1,0 +1,111 @@
+diff --git a/src-tauri/src/proxy/mappers/claude/request.rs b/src-tauri/src/proxy/mappers/claude/request.rs
+index 0ee4f9f..cbf03d9 100644
+--- a/src-tauri/src/proxy/mappers/claude/request.rs
++++ b/src-tauri/src/proxy/mappers/claude/request.rs
+@@ -803,10 +803,16 @@ fn model_supports_thinking(mapped_model: &str) -> bool {
+ /// `gemini-pro-agent` is a forced-thinking model: disabling thinking leaves
+ /// historical `functionCall` parts without `thought_signature`, which Gemini
+ /// rejects with HTTP 400.
++fn model_is_gemini_flash_family(mapped_model: &str) -> bool {
++    mapped_model.contains("gemini")
++        && (mapped_model.contains("flash") || mapped_model.contains("-flash-"))
++}
++
+ fn model_keeps_thinking_without_signature(mapped_model: &str) -> bool {
+-    mapped_model.contains("gemini-3-flash")
+-        || mapped_model.contains("gemini-3.1-flash")
+-        || mapped_model.contains("gemini-pro-agent")
++    // Gemini 3.5/3.6/3.7 Flash (and later) all require thought_signature on
++    // functionCall parts. The old 3 / 3.1-only whitelist left 3.7 Flash
++    // disabling thinking, so Claude Code tool turns hit HTTP 400.
++    model_is_gemini_flash_family(mapped_model) || mapped_model.contains("gemini-pro-agent")
+ }
+ 
+ /// Minimum length for a valid thought_signature
+@@ -1354,11 +1360,19 @@ fn build_contents(
+                                 }
+                             }
+                         } else {
+-                            // [NEW] Handle missing signature for Gemini thinking models
+-                            // Use skip_thought_signature_validator as a sentinel value
++                            // Missing signature: Gemini Flash / agent models reject
++                            // functionCall without thought_signature even when thinking
++                            // was disabled as a fallback. Always inject the sentinel
++                            // for those models (Vertex AI still rejects it).
+                             let is_google_cloud = mapped_model.starts_with("projects/");
+-                            if is_thinking_enabled && !is_google_cloud {
+-                                tracing::debug!("[Tool-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", id);
++                            let needs_sentinel = !is_google_cloud
++                                && (is_thinking_enabled
++                                    || model_keeps_thinking_without_signature(&mapped_model));
++                            if needs_sentinel {
++                                tracing::info!(
++                                    "[Tool-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {} (model: {})",
++                                    id, mapped_model
++                                );
+                                 part["thoughtSignature"] =
+                                     json!("skip_thought_signature_validator");
+                                 part["thought_signature"] =
+@@ -3244,6 +3258,11 @@ mod tests {
+     fn test_model_keeps_thinking_without_signature() {
+         assert!(model_keeps_thinking_without_signature("gemini-3-flash"));
+         assert!(model_keeps_thinking_without_signature("gemini-3.1-flash"));
++        assert!(model_keeps_thinking_without_signature("gemini-3.7-flash-high"));
++        assert!(model_keeps_thinking_without_signature(
++            "gemini-3.6-flash-medium"
++        ));
++        assert!(model_keeps_thinking_without_signature("gemini-3.5-flash-low"));
+         assert!(model_keeps_thinking_without_signature("gemini-pro-agent"));
+         assert!(!model_keeps_thinking_without_signature("gemini-3.1-pro"));
+         assert!(!model_keeps_thinking_without_signature(
+diff --git a/src-tauri/src/proxy/mappers/gemini/wrapper.rs b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
+index 8e997cf..0b36700 100644
+--- a/src-tauri/src/proxy/mappers/gemini/wrapper.rs
++++ b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
+@@ -291,13 +291,12 @@ pub fn wrap_request_v2(
+                                     obj.insert("thought_signature".to_string(), json!(sig));
+                                     tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
+                                 } else {
+-                                    // [FIX #2167] Session 缓存为空时对 flash 模型注入哨兵值
+-                                    // Flash 模型如果不提供任何签名，Gemini API 会拒绝 functionCall
+-                                    let is_flash =
+-                                        final_model_name.to_lowercase().contains("gemini-3-flash")
+-                                            || final_model_name
+-                                                .to_lowercase()
+-                                                .contains("gemini-3.1-flash");
++                                    // Session cache empty: Gemini 3.x Flash (including 3.5/3.6/3.7)
++                                    // rejects functionCall without thought_signature.
++                                    let model_lc = final_model_name.to_lowercase();
++                                    let is_flash = model_lc.contains("gemini")
++                                        && (model_lc.contains("flash")
++                                            || model_lc.contains("-flash-"));
+                                     if is_flash {
+                                         obj.insert(
+                                             "thoughtSignature".to_string(),
+@@ -307,9 +306,25 @@ pub fn wrap_request_v2(
+                                             "thought_signature".to_string(),
+                                             json!("skip_thought_signature_validator"),
+                                         );
+-                                        tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected sentinel signature for flash model (no session cache)");
++                                        tracing::info!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session cache)", final_model_name);
+                                     }
+                                 }
++                            } else {
++                                // No session id either: still inject sentinel for Flash.
++                                let model_lc = final_model_name.to_lowercase();
++                                let is_flash = model_lc.contains("gemini")
++                                    && (model_lc.contains("flash") || model_lc.contains("-flash-"));
++                                if is_flash {
++                                    obj.insert(
++                                        "thoughtSignature".to_string(),
++                                        json!("skip_thought_signature_validator"),
++                                    );
++                                    obj.insert(
++                                        "thought_signature".to_string(),
++                                        json!("skip_thought_signature_validator"),
++                                    );
++                                    tracing::info!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session id)", final_model_name);
++                                }
+                             }
+                         }
+                     }

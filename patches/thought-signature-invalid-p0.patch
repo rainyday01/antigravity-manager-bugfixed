@@ -1,0 +1,455 @@
+diff --git a/src-tauri/src/proxy/mappers/claude/request.rs b/src-tauri/src/proxy/mappers/claude/request.rs
+index 0ee4f9f..d4b6385 100644
+--- a/src-tauri/src/proxy/mappers/claude/request.rs
++++ b/src-tauri/src/proxy/mappers/claude/request.rs
+@@ -560,10 +560,13 @@ pub fn transform_claude_request_in(
+             // 禁用 thinking 会导致模型失去思考能力，哨兵值可让 Gemini 跳过签名校验
+             if model_keeps_thinking_without_signature(&mapped_model) {
+                 tracing::info!(
+-                    "[Thinking-Mode] [FIX #2167] No signature for model function calls. \
+-                     Will rely on sentinel injection in build_contents."
++                    "[Thinking-Mode] No cached signature for function calls. \
++                     Keeping thinking enabled; will only attach per-call signatures \
++                     (no sentinel, no latest-session reuse)."
+                 );
+-                // 保持 is_thinking_enabled = true，由 build_contents 内的哨兵处理覆盖
++                // Keep thinking on. Flash still requires a matching thought_signature
++                // on historical functionCalls; sanitizer now preserves client-replayed
++                // thinking so build_contents can pair those with the same-turn tool_use.
+             } else {
+                 tracing::warn!(
+                     "[Thinking-Mode] [FIX #295] No valid signature found for function calls. \
+@@ -796,17 +799,22 @@ fn model_supports_thinking(mapped_model: &str) -> bool {
+             && (mapped_model.contains("flash") || mapped_model.contains("-flash-")))
+ }
+ 
+-/// Whether a model should keep thinking enabled (and rely on the
+-/// `skip_thought_signature_validator` sentinel injected by `build_contents`)
+-/// when no valid signature is available, instead of disabling thinking.
++/// Whether a model should keep thinking enabled when no valid signature
++/// is available, instead of disabling thinking.
+ ///
+ /// `gemini-pro-agent` is a forced-thinking model: disabling thinking leaves
+ /// historical `functionCall` parts without `thought_signature`, which Gemini
+ /// rejects with HTTP 400.
++fn model_is_gemini_flash_family(mapped_model: &str) -> bool {
++    mapped_model.contains("gemini")
++        && (mapped_model.contains("flash") || mapped_model.contains("-flash-"))
++}
++
+ fn model_keeps_thinking_without_signature(mapped_model: &str) -> bool {
+-    mapped_model.contains("gemini-3-flash")
+-        || mapped_model.contains("gemini-3.1-flash")
+-        || mapped_model.contains("gemini-pro-agent")
++    // Gemini 3.5/3.6/3.7 Flash (and later) all require thought_signature on
++    // functionCall parts. The old 3 / 3.1-only whitelist left 3.7 Flash
++    // disabling thinking, so Claude Code tool turns hit HTTP 400.
++    model_is_gemini_flash_family(mapped_model) || mapped_model.contains("gemini-pro-agent")
+ }
+ 
+ /// Minimum length for a valid thought_signature
+@@ -990,6 +998,11 @@ fn build_contents(
+     previous_was_tool_result: &mut bool,
+     _existing_tool_result_ids: &std::collections::HashSet<String>,
+ ) -> Result<Vec<Value>, String> {
++    // Do not leak a thinking signature from a previous turn onto this
++    // message's functionCall / functionResponse parts. Gemini 3.x treats
++    // a mismatched thought_signature as HTTP 400 Invalid.
++    *last_thought_signature = None;
++
+     let mut parts = Vec::new();
+     // Track tool results in the current turn to identify missing ones
+     let mut current_turn_tool_result_ids = std::collections::HashSet::new();
+@@ -1243,54 +1256,32 @@ fn build_contents(
+                         // 存储 id -> name 映射
+                         tool_id_to_name.insert(id.clone(), name.clone());
+ 
+-                        // Signature resolution logic
+-                        // Priority: Client -> Context -> Session Cache -> Tool Cache -> Global Store (deprecated)
+-                        // [CRITICAL FIX] Do NOT use skip_thought_signature_validator for Vertex AI
+-                        // Vertex AI rejects this sentinel value, so we only add thoughtSignature if we have a real one
+-                        let final_sig = signature.as_ref()
+-                            .or(last_thought_signature.as_ref())
+-                            .cloned()
++                        // Signature resolution: only attach a signature that belongs
++                        // to THIS functionCall. Never reuse the session's latest
++                        // signature or the deprecated global store — Gemini 3.x
++                        // rejects a mismatched thought_signature as HTTP 400.
++                        //
++                        // Priority: client tool_use.signature -> thinking in this
++                        // same assistant message -> tool_id cache -> session cache
++                        // at this message index.
++                        let final_sig = signature.clone()
++                            .or_else(|| last_thought_signature.clone())
+                             .or_else(|| {
+-                                // Try session-based signature cache at specific msg_index first (Layer 3)
+-                                crate::proxy::SignatureCache::global().get_session_signature_at(session_id, msg_index)
++                                crate::proxy::SignatureCache::global().get_tool_signature(id)
+                                     .map(|s| {
+-                                        tracing::info!(
+-                                            "[Claude-Request] Recovered signature from SESSION cache at turn {} (session: {}, len: {})",
+-                                            msg_index, session_id, s.len()
+-                                        );
++                                        tracing::info!("[Claude-Request] Recovered signature from TOOL cache for tool_id: {}", id);
+                                         s
+                                     })
+                             })
+                             .or_else(|| {
+-                                // Fallback to latest session signature
+-                                crate::proxy::SignatureCache::global().get_session_signature(session_id)
++                                crate::proxy::SignatureCache::global().get_session_signature_at(session_id, msg_index)
+                                     .map(|s| {
+                                         tracing::info!(
+-                                            "[Claude-Request] Recovered latest signature from SESSION cache (session: {}, len: {})",
+-                                            session_id, s.len()
++                                            "[Claude-Request] Recovered signature from SESSION cache at turn {} (session: {}, len: {})",
++                                            msg_index, session_id, s.len()
+                                         );
+                                         s
+                                     })
+-                            })
+-                            .or_else(|| {
+-                                // Try tool-specific signature cache (Layer 1)
+-                                crate::proxy::SignatureCache::global().get_tool_signature(id)
+-                                    .map(|s| {
+-                                        tracing::info!("[Claude-Request] Recovered signature from TOOL cache for tool_id: {}", id);
+-                                        s
+-                                    })
+-                            })
+-                            .or_else(|| {
+-                                // [DEPRECATED] Global store fallback - kept for backward compatibility
+-                                let global_sig = get_thought_signature();
+-                                if global_sig.is_some() {
+-                                    tracing::warn!(
+-                                        "[Claude-Request] Using deprecated GLOBAL thought_signature fallback (length: {}). \
+-                                         This indicates session cache miss.",
+-                                        global_sig.as_ref().unwrap().len()
+-                                    );
+-                                }
+-                                global_sig
+                             });
+                         // [FIX #752] Validate signature before using
+                         // Only add thoughtSignature if we have a valid and compatible one
+@@ -1354,16 +1345,14 @@ fn build_contents(
+                                 }
+                             }
+                         } else {
+-                            // [NEW] Handle missing signature for Gemini thinking models
+-                            // Use skip_thought_signature_validator as a sentinel value
+-                            let is_google_cloud = mapped_model.starts_with("projects/");
+-                            if is_thinking_enabled && !is_google_cloud {
+-                                tracing::debug!("[Tool-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", id);
+-                                part["thoughtSignature"] =
+-                                    json!("skip_thought_signature_validator");
+-                                part["thought_signature"] =
+-                                    json!("skip_thought_signature_validator");
+-                            }
++                            // Fail closed: Antigravity agent (and Vertex) reject
++                            // skip_thought_signature_validator as "Invalid thought
++                            // signature". A missing signature is recoverable by
++                            // starting a new chat; a fake one poisons the turn.
++                            tracing::info!(
++                                "[Tool-Signature] Omitting thought_signature for tool_use: {} (model: {})",
++                                id, mapped_model
++                            );
+                         }
+                         parts.push(part);
+                     }
+@@ -1457,11 +1446,9 @@ fn build_contents(
+                             }
+                         });
+ 
+-                        // [FIX] Tool Result 也需要回填签名（如果上下文中有）
+-                        if let Some(sig) = last_thought_signature.as_ref() {
+-                            part["thoughtSignature"] = json!(sig);
+-                            part["thought_signature"] = json!(sig);
+-                        }
++                        // Do not stamp a thinking signature onto functionResponse.
++                        // Gemini validates thought_signature on functionCall parts;
++                        // a reused signature here has caused Invalid 400s.
+ 
+                         parts.push(part);
+ 
+@@ -3244,6 +3231,11 @@ mod tests {
+     fn test_model_keeps_thinking_without_signature() {
+         assert!(model_keeps_thinking_without_signature("gemini-3-flash"));
+         assert!(model_keeps_thinking_without_signature("gemini-3.1-flash"));
++        assert!(model_keeps_thinking_without_signature("gemini-3.7-flash-high"));
++        assert!(model_keeps_thinking_without_signature(
++            "gemini-3.6-flash-medium"
++        ));
++        assert!(model_keeps_thinking_without_signature("gemini-3.5-flash-low"));
+         assert!(model_keeps_thinking_without_signature("gemini-pro-agent"));
+         assert!(!model_keeps_thinking_without_signature("gemini-3.1-pro"));
+         assert!(!model_keeps_thinking_without_signature(
+diff --git a/src-tauri/src/proxy/mappers/claude/thinking_utils.rs b/src-tauri/src/proxy/mappers/claude/thinking_utils.rs
+index ebcba4d..d65717d 100644
+--- a/src-tauri/src/proxy/mappers/claude/thinking_utils.rs
++++ b/src-tauri/src/proxy/mappers/claude/thinking_utils.rs
+@@ -207,20 +207,21 @@ pub fn filter_invalid_thinking_blocks_with_family(
+                                 return false;
+                             }
+                         } else {
+-                            // [CRITICAL] Signature family not found in cache.
+-                            // This happens after a server restart when memory is cleared.
+-                            // If we pass this unverified signature to the upstream, it will likely return 400 "Invalid signature".
+-                            // It is safer to strip the signature and let the upstream regenerate it.
+-                            info!("[Thinking-Sanitizer] Dropping unverified signature (cache miss after restart)");
+-                            stripped_count += 1;
+-                            return false;
++                            // Family cache miss is normal (2h TTL, 200-entry eviction, or
++                            // the client is echoing a Gemini signature we issued earlier).
++                            // Stripping here forces later code to stamp a *different*
++                            // signature on historical functionCalls, which Gemini 3.x
++                            // rejects as "Invalid thought signature".
++                            info!(
++                                "[Thinking-Sanitizer] Keeping client-replayed thinking signature (family cache miss, len: {})",
++                                sig.len()
++                            );
+                         }
+                     } else if get_signature_family(sig).is_none() && !sig.is_empty() {
+-                        // Even if no target family is specified, we still want to filter out signatures
+-                        // that we can't verify (unless they are empty, which indicates a fresh start).
+-                        info!("[Thinking-Sanitizer] Dropping unverified signature (no target family)");
+-                        stripped_count += 1;
+-                        return false;
++                        info!(
++                            "[Thinking-Sanitizer] Keeping thinking signature with no target family (family cache miss, len: {})",
++                            sig.len()
++                        );
+                     }
+                 }
+                 true
+@@ -242,3 +243,53 @@ pub fn filter_invalid_thinking_blocks_with_family(
+         );
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn thinking_msg(sig: &str) -> Message {
++        Message {
++            role: "assistant".to_string(),
++            content: MessageContent::Array(vec![ContentBlock::Thinking {
++                thinking: "reason".to_string(),
++                signature: Some(sig.to_string()),
++                cache_control: None,
++            }]),
++        }
++    }
++
++    fn thinking_sig(messages: &[Message]) -> Option<String> {
++        match &messages[0].content {
++            MessageContent::Array(blocks) => match &blocks[0] {
++                ContentBlock::Thinking { signature, .. } => signature.clone(),
++                _ => None,
++            },
++            _ => None,
++        }
++    }
++
++    #[test]
++    fn sanitizer_keeps_thinking_on_family_cache_miss() {
++        SignatureCache::global().clear();
++        let sig = "a".repeat(80);
++        let mut messages = vec![thinking_msg(&sig)];
++        filter_invalid_thinking_blocks_with_family(&mut messages, Some("gemini-3.7-flash-high"));
++        assert_eq!(thinking_sig(&messages).as_deref(), Some(sig.as_str()));
++    }
++
++    #[test]
++    fn sanitizer_drops_cross_family_thinking() {
++        SignatureCache::global().clear();
++        let sig = "b".repeat(80);
++        SignatureCache::global().cache_thinking_family(sig.clone(), "claude-sonnet".to_string());
++        let mut messages = vec![thinking_msg(&sig)];
++        filter_invalid_thinking_blocks_with_family(&mut messages, Some("gemini-3.7-flash-high"));
++        match &messages[0].content {
++            MessageContent::Array(blocks) => {
++                assert!(!matches!(blocks[0], ContentBlock::Thinking { .. }));
++            }
++            _ => panic!("expected remaining content"),
++        }
++    }
++}
+diff --git a/src-tauri/src/proxy/mappers/gemini/wrapper.rs b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
+index 8e997cf..751e217 100644
+--- a/src-tauri/src/proxy/mappers/gemini/wrapper.rs
++++ b/src-tauri/src/proxy/mappers/gemini/wrapper.rs
+@@ -283,33 +283,15 @@ pub fn wrap_request_v2(
+                                 if obj.get("thought_signature").is_none() {
+                                     obj.insert("thought_signature".to_string(), sig);
+                                 }
+-                            } else if let Some(s_id) = session_id {
+-                                if let Some(sig) = crate::proxy::SignatureCache::global()
+-                                    .get_session_signature(s_id)
+-                                {
+-                                    obj.insert("thoughtSignature".to_string(), json!(sig));
+-                                    obj.insert("thought_signature".to_string(), json!(sig));
+-                                    tracing::debug!("[Gemini-Wrap] Injected signature (len: {}) for session: {}", sig.len(), s_id);
+-                                } else {
+-                                    // [FIX #2167] Session 缓存为空时对 flash 模型注入哨兵值
+-                                    // Flash 模型如果不提供任何签名，Gemini API 会拒绝 functionCall
+-                                    let is_flash =
+-                                        final_model_name.to_lowercase().contains("gemini-3-flash")
+-                                            || final_model_name
+-                                                .to_lowercase()
+-                                                .contains("gemini-3.1-flash");
+-                                    if is_flash {
+-                                        obj.insert(
+-                                            "thoughtSignature".to_string(),
+-                                            json!("skip_thought_signature_validator"),
+-                                        );
+-                                        obj.insert(
+-                                            "thought_signature".to_string(),
+-                                            json!("skip_thought_signature_validator"),
+-                                        );
+-                                        tracing::debug!("[Gemini-Wrap] [FIX #2167] Injected sentinel signature for flash model (no session cache)");
+-                                    }
+-                                }
++                            } else {
++                                // Fail closed: do not stamp the session's latest
++                                // signature or skip_thought_signature_validator.
++                                // Antigravity agent rejects both as Invalid.
++                                tracing::info!(
++                                    "[Gemini-Wrap] Leaving functionCall unsigned (model: {}, session: {:?})",
++                                    final_model_name,
++                                    session_id
++                                );
+                             }
+                         }
+                     }
+@@ -903,7 +885,7 @@ mod test_fixes {
+     use serde_json::json;
+ 
+     #[test]
+-    fn test_wrap_request_with_signature() {
++    fn test_wrap_request_does_not_reuse_latest_session_signature() {
+         let session_id = "test-session-sig";
+         let signature = "test-signature-must-be-longer-than-fifty-characters-to-be-cached-by-signature-cache-12345"; // > 50 chars
+         crate::proxy::SignatureCache::global().cache_session_signature(
+@@ -913,7 +895,7 @@ mod test_fixes {
+         );
+ 
+         let body = json!({
+-            "model": "gemini-pro",
++            "model": "gemini-3.7-flash-high",
+             "contents": [{
+                 "role": "user",
+                 "parts": [{
+@@ -925,11 +907,10 @@ mod test_fixes {
+             }]
+         });
+ 
+-        let result = wrap_request(&body, "proj", "gemini-pro", None, Some(session_id), None);
+-        let injected_sig = result["request"]["contents"][0]["parts"][0]["thoughtSignature"]
+-            .as_str()
+-            .unwrap();
+-        assert_eq!(injected_sig, signature);
++        let result = wrap_request(&body, "proj", "gemini-3.7-flash-high", None, Some(session_id), None);
++        let part = &result["request"]["contents"][0]["parts"][0];
++        assert!(part.get("thoughtSignature").is_none());
++        assert!(part.get("thought_signature").is_none());
+     }
+ 
+     #[test]
+diff --git a/src-tauri/src/proxy/mappers/openai/request.rs b/src-tauri/src/proxy/mappers/openai/request.rs
+index 8c45b8c..f5533d8 100644
+--- a/src-tauri/src/proxy/mappers/openai/request.rs
++++ b/src-tauri/src/proxy/mappers/openai/request.rs
+@@ -452,17 +452,13 @@ pub fn transform_openai_request(
+                 // "Expected thinking... but found tool_use/text"
+                 // 如果是思维模型且缺失 reasoning_content, 则注入占位符
+                 tracing::debug!("[OpenAI-Thinking] Injecting placeholder thinking block for assistant message");
+-                let mut thought_part = json!({
++                let thought_part = json!({
+                     "text": "Applying tool decisions and generating response...",
+                     "thought": true,
+                 });
+ 
+-                // [FIX #1575] 占位符永远不能使用真实签名（签名与真实思考内容绑定）
+-                // 仅 Gemini 支持哨兵值跳过验证
+-                if is_gemini_3_thinking {
+-                    thought_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+-                    thought_part["thought_signature"] = json!("skip_thought_signature_validator");
+-                }
++                // Placeholder thoughts must not carry skip_thought_signature_validator.
++                // Antigravity agent rejects that sentinel as Invalid.
+ 
+                 parts.push(thought_part);
+             }
+@@ -600,12 +596,12 @@ pub fn transform_openai_request(
+                         func_call_part["thoughtSignature"] = json!(sig);
+                         func_call_part["thought_signature"] = json!(sig);
+                     } else if is_thinking_model || is_gemini_flash_thinking {
+-                        // [NEW] Handle missing signature for Gemini thinking models
+-                        // [FIX #1650] Allow sentinel injection for Vertex AI (projects/...) as well
+-                        // [FIX #2167] Also applies to gemini-3-flash / gemini-3.1-flash
+-                        tracing::debug!("[OpenAI-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {}", tc.id);
+-                        func_call_part["thoughtSignature"] = json!("skip_thought_signature_validator");
+-                        func_call_part["thought_signature"] = json!("skip_thought_signature_validator");
++                        // Fail closed: do not inject skip_thought_signature_validator.
++                        // Antigravity agent rejects the sentinel as Invalid.
++                        tracing::info!(
++                            "[OpenAI-Signature] Omitting thought_signature for tool_use: {}",
++                            tc.id
++                        );
+                     }
+ 
+                     parts.push(func_call_part);
+@@ -1644,25 +1640,28 @@ mod tests {
+         let (result, _sid, _msg_count, _) =
+             transform_openai_request(&req, "test-v", mapped_model, None);
+ 
+-        // Extract the tool call part from contents
+-        let contents = result["contents"].as_array().unwrap();
+-        // Identify the part with functionCall
+-        let parts = contents[0]["parts"].as_array().unwrap();
+-        let tool_part = parts
++        let contents = result
++            .pointer("/request/contents")
++            .or_else(|| result.get("contents"))
++            .and_then(|v| v.as_array())
++            .expect("should have contents");
++        let tool_part = contents
+             .iter()
+-            .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
++            .flat_map(|c| c.get("parts").and_then(|p| p.as_array()).into_iter().flatten())
++            .find(|p| p.get("functionCall").is_some())
+             .expect("Should find functionCall part");
+ 
+-        // Vertex AI requires sentinel
+-        assert_eq!(
+-            tool_part["thoughtSignature"].as_str(),
+-            Some("skip_thought_signature_validator")
++        // Fail closed: do not invent a sentinel for Vertex / Antigravity.
++        assert!(
++            tool_part.get("thoughtSignature").is_none(),
++            "must not inject skip_thought_signature_validator"
+         );
+     }
+ 
+     #[test]
+     fn test_issue_2167_gemini_flash_thinking_signature() {
+-        // [FIX #2167] gemini-3-flash / gemini-3.1-flash 在无缓存签名时，functionCall 必须携带 thoughtSignature
++        // Unsigned Flash functionCalls stay unsigned. A fake sentinel is
++        // rejected by Antigravity as Invalid thought signature.
+         for model in &["gemini-3-flash", "gemini-3.1-flash"] {
+             let req = OpenAIRequest {
+                 model: model.to_string(),
+@@ -1705,10 +1704,9 @@ mod tests {
+                 .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
+                 .expect(&format!("[{model}] Should find functionCall part"));
+ 
+-            assert_eq!(
+-                tool_part["thoughtSignature"].as_str(),
+-                Some("skip_thought_signature_validator"),
+-                "[{model}] gemini-3-flash functionCall must contain thoughtSignature sentinel"
++            assert!(
++                tool_part.get("thoughtSignature").is_none(),
++                "[{model}] must not inject skip_thought_signature_validator"
+             );
+         }
+     }
