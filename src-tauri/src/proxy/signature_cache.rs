@@ -2,8 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-// Node.js proxy uses 2 hours TTL
-const SIGNATURE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+// Family cache: short TTL is enough to catch cross-model reuse.
+const FAMILY_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+// Tool/session replay: OpenAI clients (DSH etc.) do not always echo
+// thought_signature. 2h expiry dropped a live Gemini 3.7 Flash session
+// after a few hours idle and the model then emitted malformed tool args.
+const REPLAY_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MIN_SIGNATURE_LENGTH: usize = 50;
 
 // Different cache limits for different layers
@@ -34,7 +38,11 @@ impl<T> CacheEntry<T> {
     }
 
     fn is_expired(&self) -> bool {
-        self.timestamp.elapsed().unwrap_or(Duration::ZERO) > SIGNATURE_TTL
+        self.timestamp.elapsed().unwrap_or(Duration::ZERO) > FAMILY_TTL
+    }
+
+    fn is_replay_expired(&self) -> bool {
+        self.timestamp.elapsed().unwrap_or(Duration::ZERO) > REPLAY_TTL
     }
 }
 
@@ -97,7 +105,7 @@ impl SignatureCache {
             // Clean up expired entries when limit is reached
             if cache.len() > TOOL_CACHE_LIMIT {
                 let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
+                cache.retain(|_, v| !v.is_replay_expired());
                 let after = cache.len();
                 if before != after {
                     tracing::debug!(
@@ -114,7 +122,7 @@ impl SignatureCache {
     pub fn get_tool_signature(&self, tool_use_id: &str) -> Option<String> {
         if let Ok(cache) = self.tool_signatures.lock() {
             if let Some(entry) = cache.get(tool_use_id) {
-                if !entry.is_expired() {
+                if !entry.is_replay_expired() {
                     tracing::debug!(
                         "[SignatureCache] Hit tool signature for id: {}",
                         tool_use_id
@@ -239,7 +247,7 @@ impl SignatureCache {
             // Cleanup when limit is reached (Session cache has largest limit)
             if cache.len() > SESSION_CACHE_LIMIT {
                 let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
+                cache.retain(|_, v| !v.is_replay_expired());
                 let after = cache.len();
                 if before != after {
                     tracing::info!(
@@ -258,7 +266,7 @@ impl SignatureCache {
     pub fn get_session_signature(&self, session_id: &str) -> Option<String> {
         if let Ok(cache) = self.session_signatures.lock() {
             if let Some(entry) = cache.get(session_id) {
-                if !entry.is_expired() {
+                if !entry.is_replay_expired() {
                     // Find the signature with the maximum message_count (the latest one)
                     if let Some(sig_entry) = entry.data.values().max_by_key(|e| e.message_count) {
                         tracing::debug!(
@@ -286,7 +294,7 @@ impl SignatureCache {
     ) -> Option<String> {
         if let Ok(cache) = self.session_signatures.lock() {
             if let Some(entry) = cache.get(session_id) {
-                if !entry.is_expired() {
+                if !entry.is_replay_expired() {
                     if let Some(sig_entry) = entry.data.get(&message_count) {
                         tracing::debug!(
                             "[SignatureCache] Session {} (msg_count={}) -> HIT (len={})",

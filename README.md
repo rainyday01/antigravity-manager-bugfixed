@@ -3,7 +3,7 @@
 > **这是社区修补快照，不是官方仓库。**
 >
 > 基于 [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) **v4.5.6**，只改 Gemini 3.x `thought_signature` 协议转换。
-> 官方 **v4.5.7** 吸收了「缺签名」修复，但仍注入哨兵并复用 latest session 签名；官方 **v4.5.8** 仍未吸收「Invalid thought signature」修复。因此本仓库停在 4.5.6 + 本地补丁，不跟随 `latest`。
+> 官方 **v4.5.7** 吸收了「缺签名」修复，但仍注入哨兵并复用 latest session 签名；官方 **v4.5.8** 仍未吸收「Invalid thought signature」以及 OpenAI 兼容层签名透传。因此本仓库停在 4.5.6 + 本地 P0/P1 补丁，不跟随 `latest`。
 >
 > **请先读 [WHY-WE-PATCH.md](./WHY-WE-PATCH.md)。** 本树里的 `install.sh` / Cask 仍会下载**官方未修补**安装包。要用本补丁，必须从源码自行编译。
 >

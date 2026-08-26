@@ -128,6 +128,36 @@ pub struct ToolCall {
     pub call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<ApplyPatchOperation>,
+
+    // Gemini 3 thought signatures. OpenAI chat/completions has no standard
+    // field, so we emit both a top-level extra and Google's extra_content
+    // shape. Clients that round-trip unknown fields (DSH) can send them back.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "thoughtSignature"
+    )]
+    pub thought_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<Value>,
+}
+
+impl ToolCall {
+    pub fn resolved_thought_signature(&self) -> Option<String> {
+        const MIN: usize = 50;
+        if let Some(s) = self.thought_signature.as_ref() {
+            if s.len() >= MIN {
+                return Some(s.clone());
+            }
+        }
+        self.extra_content.as_ref().and_then(|v| {
+            v.pointer("/google/thought_signature")
+                .or_else(|| v.pointer("/google/thoughtSignature"))
+                .and_then(|s| s.as_str())
+                .filter(|s| s.len() >= MIN)
+                .map(|s| s.to_string())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 // OpenAI 协议响应转换模块
 use super::models::*;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub fn resolve_shell_tool_name(
     model_tool_name: &str,
@@ -76,6 +76,7 @@ pub fn transform_openai_response(
             let mut content_out = String::new();
             let mut thought_out = String::new();
             let mut tool_calls = Vec::new();
+            let mut last_part_sig: Option<String> = None;
 
             // 提取 content 和 tool_calls
             if let Some(parts) = candidate
@@ -90,6 +91,7 @@ pub fn transform_openai_response(
                         .or(part.get("thought_signature"))
                         .and_then(|s| s.as_str())
                     {
+                        last_part_sig = Some(sig.to_string());
                         if let Some(sid) = session_id {
                             super::streaming::store_thought_signature(sig, sid, message_count);
                         }
@@ -168,6 +170,15 @@ pub fn transform_openai_response(
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| format!("{}-{}", final_name, uuid::Uuid::new_v4()));
 
+                        let part_sig = part
+                            .get("thoughtSignature")
+                            .or(part.get("thought_signature"))
+                            .and_then(|s| s.as_str());
+                        let bound_sig = super::streaming::bind_tool_call_signature(
+                            &id,
+                            part_sig.or(last_part_sig.as_deref()),
+                        );
+
                         tool_calls.push(ToolCall {
                             id,
                             r#type: "function".to_string(),
@@ -178,6 +189,10 @@ pub fn transform_openai_response(
                             status: None,
                             call_id: None,
                             operation: None,
+                            thought_signature: bound_sig.clone(),
+                            extra_content: bound_sig.as_ref().map(|s| {
+                                json!({ "google": { "thought_signature": s } })
+                            }),
                         });
                     }
 

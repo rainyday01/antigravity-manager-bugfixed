@@ -375,16 +375,6 @@ pub fn transform_openai_request(
         }
     }
 
-    // 从缓存获取当前会话的思维签名
-    let thought_sig = session_thought_sig;
-    if thought_sig.is_some() {
-        tracing::debug!(
-            "[OpenAI-Request] Using session signature (sid: {}, len: {})",
-            session_id,
-            thought_sig.as_ref().unwrap().len()
-        );
-    }
-
     // [New] 预先构建工具名称到原始 Schema 的映射，用于后续参数类型修正
     let mut tool_name_to_schema = std::collections::HashMap::new();
     if let Some(tools) = &request.tools {
@@ -434,6 +424,10 @@ pub fn transform_openai_request(
             };
 
             let mut parts = Vec::new();
+            // Do not leak a previous turn's signature onto this message's
+            // functionCalls. Gemini 3.x treats a mismatched thought_signature
+            // as HTTP 400 Invalid; a missing one degrades tool-call quality.
+            let mut last_thought_signature: Option<String> = None;
 
             // Handle reasoning_content (thinking)
             if let Some(reasoning) = &msg.reasoning_content {
@@ -592,7 +586,22 @@ pub fn transform_openai_request(
                     // [New] 递归清理参数中可能存在的非法校验字段
                     crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
 
-                    if let Some(ref sig) = thought_sig {
+                    // Per-call binding only: client extra field, this tool_id,
+                    // this message index, or thinking in the same assistant
+                    // message. Never reuse the session's latest signature.
+                    let final_sig = tc
+                        .resolved_thought_signature()
+                        .or_else(|| {
+                            crate::proxy::SignatureCache::global().get_tool_signature(&tc.id)
+                        })
+                        .or_else(|| {
+                            crate::proxy::SignatureCache::global()
+                                .get_session_signature_at(&session_id, msg_index)
+                        })
+                        .or_else(|| last_thought_signature.clone());
+
+                    if let Some(sig) = final_sig {
+                        last_thought_signature = Some(sig.clone());
                         func_call_part["thoughtSignature"] = json!(sig);
                         func_call_part["thought_signature"] = json!(sig);
                     } else if is_thinking_model || is_gemini_flash_thinking {
@@ -1626,6 +1635,8 @@ mod tests {
                     status: None,
                     call_id: None,
                     operation: None,
+                    thought_signature: None,
+                    extra_content: None,
                 }]),
                 tool_call_id: None,
                 name: None,
@@ -1680,6 +1691,8 @@ mod tests {
                         status: None,
                         call_id: None,
                         operation: None,
+                        thought_signature: None,
+                        extra_content: None,
                     }]),
                     tool_call_id: None,
                     name: None,
@@ -1709,6 +1722,92 @@ mod tests {
                 "[{model}] must not inject skip_thought_signature_validator"
             );
         }
+    }
+
+    #[test]
+    fn test_openai_replays_client_and_tool_cache_signatures() {
+        let sig = "client-replayed-thought-signature-value-must-be-over-fifty-chars";
+        let req = OpenAIRequest {
+            model: "gemini-3.7-flash-high".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "assistant".to_string(),
+                refusal: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_dsh_replay".to_string(),
+                    r#type: "function".to_string(),
+                    function: Some(ToolFunction {
+                        name: "bash".to_string(),
+                        arguments: "{\"command\":\"ls\"}".to_string(),
+                    }),
+                    status: None,
+                    call_id: None,
+                    operation: None,
+                    thought_signature: Some(sig.to_string()),
+                    extra_content: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+            }],
+            ..Default::default()
+        };
+
+        let (result, _sid, _msg_count, _) =
+            transform_openai_request(&req, "test-proj", "gemini-3.7-flash-high", None);
+        let contents = result["request"]["contents"]
+            .as_array()
+            .expect("Should have request.contents");
+        let tool_part = contents
+            .iter()
+            .flat_map(|c| c.get("parts").and_then(|p| p.as_array()).into_iter().flatten())
+            .find(|p| p.get("functionCall").is_some())
+            .expect("Should find functionCall part");
+        assert_eq!(tool_part["thoughtSignature"].as_str(), Some(sig));
+
+        let cached_sig = "tool-cache-thought-signature-value-must-be-over-fifty-chars-xx";
+        crate::proxy::SignatureCache::global().cache_tool_signature(
+            "call_from_cache",
+            cached_sig.to_string(),
+        );
+        let req2 = OpenAIRequest {
+            model: "gemini-3.7-flash-high".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "assistant".to_string(),
+                refusal: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_from_cache".to_string(),
+                    r#type: "function".to_string(),
+                    function: Some(ToolFunction {
+                        name: "bash".to_string(),
+                        arguments: "{\"command\":\"pwd\"}".to_string(),
+                    }),
+                    status: None,
+                    call_id: None,
+                    operation: None,
+                    thought_signature: None,
+                    extra_content: None,
+                }]),
+                tool_call_id: None,
+                name: None,
+            }],
+            ..Default::default()
+        };
+        let (result2, _, _, _) =
+            transform_openai_request(&req2, "test-proj", "gemini-3.7-flash-high", None);
+        let tool_part2 = result2["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c.get("parts").and_then(|p| p.as_array()).into_iter().flatten())
+            .find(|p| p.get("functionCall").is_some())
+            .unwrap();
+        assert_eq!(
+            tool_part2["thoughtSignature"].as_str(),
+            Some(cached_sig)
+        );
     }
 
     #[test]

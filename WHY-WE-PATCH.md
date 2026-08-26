@@ -9,8 +9,8 @@
 **包含**
 
 - 官方 v4.5.6 源码快照（tag `v4.5.6`，commit `a2e3c45`）
-- 当前生效的协议层补丁（工作树 = v4.5.6 + 第二轮 P0；P0 已包含第一轮的 Flash 家族泛化，并撤销了哨兵注入）
-- 两轮补丁文件：`patches/`
+- 当前生效的协议层补丁（工作树 = v4.5.6 + P0 + P1；P0 含 Flash 家族泛化并撤销哨兵；P1 补 OpenAI 兼容层签名透传）
+- 补丁文件：`patches/`
 - 可选的 Debian bookworm 后端构建文件：`docker/Dockerfile.backend.slim`
 
 **不包含**
@@ -136,7 +136,7 @@ Dropping unverified signature (cache miss after restart)
 | `src-tauri/src/proxy/mappers/claude/thinking_utils.rs` | family cache miss → **丢掉** thinking | cache miss 时 **保留** 客户端回放的 thinking |
 | `src-tauri/src/proxy/mappers/claude/request.rs` | 跨消息沿用 `last_thought_signature`；fallback 到 latest session / 全局 store / skip 哨兵 | **每条消息重置** `last_thought_signature`；只接受「本条 tool_use 自带 / 同一条 assistant 消息里的 thinking / tool_id cache / `get_session_signature_at`」；无签名就省略字段 |
 | `src-tauri/src/proxy/mappers/gemini/wrapper.rs` | Flash 无签名时注入 latest 或 skip 哨兵 | 无签名则 `Leaving functionCall unsigned`，不盖 latest、不盖哨兵 |
-| `src-tauri/src/proxy/mappers/openai/request.rs` | 占位 thinking / 无签名 tool_use 注入 skip 哨兵 | 同样省略，不注入哨兵 |
+| `src-tauri/src/proxy/mappers/openai/request.rs` | 占位 thinking / 无签名 tool_use 注入 skip 哨兵；P0 后改为整段省略 | P1：按 tool_call 回放真实签名，见下一节 |
 
 签名绑定优先级（Claude 映射，P0 之后）：
 
@@ -155,7 +155,25 @@ tool_use.signature
 - 不注入 `skip_thought_signature_validator`
 - 不把 thinking 签名盖到 `functionResponse` 上
 
-当前工作树就是 **官方 v4.5.6 + 这一份 P0**。P0 已经带上 Flash 家族泛化，因此不必再叠第一轮 patch（两份都是相对 v4.5.6 的完整 diff，顺序 apply 会冲突）。第一轮文件只作历史对照。
+P0 已经带上 Flash 家族泛化，因此不必再叠第一轮 patch（两份都是相对 v4.5.6 的完整 diff，顺序 apply 会冲突）。第一轮文件只作历史对照。
+
+---
+
+## 4.1 第三轮 P1：OpenAI 兼容层签名透传
+
+补丁：`patches/thought-signature-openai-p1.patch`（相对本仓库 P0 快照，不是相对官方裸 v4.5.6）。
+
+P0 把 OpenAI 路径也改成「无签名就省略、不用 latest」。这对 Claude Code 是对的，因为 Anthropic 消息里会带回 thinking。走 **OpenAI `/v1/chat/completions`** 的客户端（例如 DSH）没有标准字段装 `thoughtSignature`，历史 `functionCall` 在网关侧就会变成无签名。
+
+Gemini 3.x Flash 这时不一定立刻 400。官方说明是 missing thought_signature **may lead to degraded model performance**：后续工具调用漏必填参数（`bash` 只剩 `description`、`write` 空参）。会话中断几小时后更明显——原先 session/tool 缓存 TTL 只有 2 小时，过期后整段历史全部 `Omitting thought_signature`。
+
+P1 做了三件事：
+
+1. **响应侧透传**：流式 / 非流式把签名写到 `tool_call.thought_signature` 以及 `extra_content.google.thought_signature`，并按网关生成的 `call_*` id 写入 tool cache。
+2. **请求侧按条回放**：客户端带回的字段 → `get_tool_signature(tool_id)` → `get_session_signature_at(session, msg_index)` → 同一条 assistant 消息里已绑定的签名。仍然 **不用** `get_session_signature()` latest，也 **不** 注入 skip 哨兵。
+3. **回放缓存 TTL**：tool / session 签名从 2 小时改为 **7 天**（family cache 仍是 2 小时）。
+
+当前工作树 = **官方 v4.5.6 + P0 + P1**。
 
 ---
 
@@ -191,7 +209,7 @@ v4.5.8 的 503 修复只影响 Claude Agent SDK / CC GUI 那种独立身份声�
 antigravity-manager:local-4.5.6-sigfix
 ```
 
-不要把本仓库描述成「官方 4.5.6」。它是 **4.5.6 + thought_signature P0**。
+不要把本仓库描述成「官方 4.5.6」。它是 **4.5.6 + thought_signature P0 + OpenAI P1**。
 
 ---
 
@@ -215,11 +233,11 @@ docker build -f docker/Dockerfile.backend.slim -t antigravity-manager:local-4.5.
 
 ```bash
 cd src-tauri
-cargo test --bin antigravity_tools model_keeps_thinking_without_signature
-cargo test --bin antigravity_tools skip_thought_signature_validator
+cargo test --lib skip_thought_signature_validator
+cargo test --lib openai_replays_client
 ```
 
-官方原有测试里有「应当注入哨兵」的用例，P0 已改成「不得注入哨兵」。
+官方原有测试里有「应当注入哨兵」的用例，P0 已改成「不得注入哨兵」。P1 另有客户端回放 / tool-id 缓存测试。
 
 ---
 
@@ -241,11 +259,14 @@ cargo test --bin antigravity_tools skip_thought_signature_validator
 | 路径 | 作用 |
 |---|---|
 | `patches/thought-signature-gemini-3.7.patch` | 第一轮历史补丁（缺签名 / Flash 白名单）。不要再 apply 到当前树 |
-| `patches/thought-signature-invalid-p0.patch` | 第二轮 P0，相对官方 v4.5.6 的完整 diff，即当前源码 |
+| `patches/thought-signature-invalid-p0.patch` | 第二轮 P0，相对官方 v4.5.6 |
+| `patches/thought-signature-openai-p1.patch` | 第三轮 P1，相对本仓库 P0 快照：OpenAI 签名透传 + 7 天回放缓存 |
 | `patches/README.md` | 补丁使用说明 |
 | `src-tauri/src/proxy/mappers/claude/request.rs` | Claude → Gemini 签名绑定 |
 | `src-tauri/src/proxy/mappers/claude/thinking_utils.rs` | sanitizer：cache miss 保留 thinking |
 | `src-tauri/src/proxy/mappers/gemini/wrapper.rs` | 原生 Gemini 包装：无签名则保持 unsigned |
-| `src-tauri/src/proxy/mappers/openai/request.rs` | OpenAI 兼容路径同样 fail-closed |
+| `src-tauri/src/proxy/mappers/openai/request.rs` | OpenAI 请求：按 tool_call 回放签名 |
+| `src-tauri/src/proxy/mappers/openai/streaming.rs` / `response.rs` / `collector.rs` / `models.rs` | OpenAI 响应把签名交给客户端 |
+| `src-tauri/src/proxy/signature_cache.rs` | tool/session 回放 TTL 7 天 |
 | `docker/Dockerfile.backend.slim` | 可选：bookworm 后端构建 |
 | `src-tauri/src/modules/oauth.rs` | 去掉上游硬编码 OAuth 常量，改环境变量（仅为了能推送到 GitHub） |

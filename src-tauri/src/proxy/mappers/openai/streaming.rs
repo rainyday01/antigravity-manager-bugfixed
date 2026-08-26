@@ -29,6 +29,21 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
     );
 }
 
+/// Bind a Gemini thought signature to the OpenAI tool_call id the client will echo.
+pub fn bind_tool_call_signature(call_id: &str, sig: Option<&str>) -> Option<String> {
+    let s = sig.filter(|v| v.len() >= 50)?;
+    crate::proxy::SignatureCache::global().cache_tool_signature(call_id, s.to_string());
+    Some(s.to_string())
+}
+
+fn tool_call_signature_extras(sig: &str) -> Value {
+    json!({
+        "thought_signature": sig,
+        "thoughtSignature": sig,
+        "extra_content": { "google": { "thought_signature": sig } }
+    })
+}
+
 /// Extract and convert Gemini usageMetadata to OpenAI usage format
 /// Supports both legacy v1internal format and new Interactions API format.
 ///
@@ -126,6 +141,7 @@ where
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
         let mut tool_call_index = 0;
+        let mut last_thought_sig: Option<String> = None;
 
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -173,6 +189,7 @@ where
                                                             }
                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
                                                                 store_thought_signature(sig, &session_id, message_count);
+                                                                last_thought_sig = Some(sig.to_string());
                                                             }
                                                             if let Some(img) = part.get("inlineData") {
                                                                 let mime_type = img.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
@@ -212,6 +229,21 @@ where
                                                                     let call_id = format!("call_{:x}", hasher.finish());
 
                                                                     let args_str = serde_json::to_string(&args).unwrap_or_default();
+                                                                    let part_sig = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str());
+                                                                    let bound_sig = bind_tool_call_signature(&call_id, part_sig.or(last_thought_sig.as_deref()));
+                                                                    let mut tc_obj = json!({
+                                                                        "index": tool_call_index,
+                                                                        "id": call_id,
+                                                                        "type": "function",
+                                                                        "function": { "name": final_name, "arguments": args_str }
+                                                                    });
+                                                                    if let Some(ref sig) = bound_sig {
+                                                                        if let Some(extra) = tool_call_signature_extras(sig).as_object() {
+                                                                            for (k, v) in extra {
+                                                                                tc_obj[k] = v.clone();
+                                                                            }
+                                                                        }
+                                                                    }
                                                                     let tool_call_chunk = json!({
                                                                         "id": &stream_id,
                                                                         "object": "chat.completion.chunk",
@@ -221,12 +253,7 @@ where
                                                                             "index": idx as u32,
                                                                             "delta": {
                                                                                 "role": "assistant",
-                                                                                "tool_calls": [{
-                                                                                    "index": tool_call_index,
-                                                                                    "id": call_id,
-                                                                                    "type": "function",
-                                                                                    "function": { "name": final_name, "arguments": args_str }
-                                                                                }]
+                                                                                "tool_calls": [tc_obj]
                                                                             },
                                                                             "finish_reason": serde_json::Value::Null
                                                                         }]
@@ -796,6 +823,11 @@ where
                                                                 use std::hash::{Hash, Hasher};
                                                                 call_key.hash(&mut hasher);
                                                                 let call_id = format!("call_{:x}", hasher.finish());
+                                                                let part_sig = part
+                                                                    .get("thoughtSignature")
+                                                                    .or(part.get("thought_signature"))
+                                                                    .and_then(|s| s.as_str());
+                                                                bind_tool_call_signature(&call_id, part_sig);
 
                                                                 let (actual_name, namespace) = split_namespace_tool_name(name);
                                                                 let tool_item_id = format!("item-{}", &Uuid::new_v4().to_string()[..16]);

@@ -1,0 +1,499 @@
+diff --git a/src-tauri/src/proxy/mappers/openai/collector.rs b/src-tauri/src/proxy/mappers/openai/collector.rs
+index 7fc11d3..db75f28 100644
+--- a/src-tauri/src/proxy/mappers/openai/collector.rs
++++ b/src-tauri/src/proxy/mappers/openai/collector.rs
+@@ -26,8 +26,9 @@ where
+     let mut content_parts: Vec<String> = Vec::new();
+     let mut reasoning_parts: Vec<String> = Vec::new();
+     let mut finish_reason: Option<String> = None;
+-    // Tool calls aggregation: index -> (id, type, name, arguments_parts)
+-    let mut tool_calls_map: HashMap<u32, (String, String, String, Vec<String>)> = HashMap::new();
++    // Tool calls aggregation: index -> (id, type, name, arguments_parts, thought_signature)
++    let mut tool_calls_map: HashMap<u32, (String, String, String, Vec<String>, Option<String>)> =
++        HashMap::new();
+ 
+     while let Some(chunk_result) = stream.next().await {
+         let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
+@@ -123,6 +124,7 @@ where
+                                                     String::from("function"),
+                                                     String::new(),
+                                                     Vec::new(),
++                                                    None,
+                                                 )
+                                             });
+ 
+@@ -154,6 +156,23 @@ where
+                                                 entry.3.push(args.to_string());
+                                             }
+                                         }
++
++                                        let incoming_sig = tc
++                                            .get("thought_signature")
++                                            .or(tc.get("thoughtSignature"))
++                                            .and_then(|v| v.as_str())
++                                            .or_else(|| {
++                                                tc.get("extra_content")
++                                                    .and_then(|v| {
++                                                        v.pointer("/google/thought_signature")
++                                                    })
++                                                    .and_then(|v| v.as_str())
++                                            });
++                                        if let Some(sig) = incoming_sig {
++                                            if sig.len() >= 50 {
++                                                entry.4 = Some(sig.to_string());
++                                            }
++                                        }
+                                     }
+                                 }
+                             }
+@@ -182,7 +201,10 @@ where
+     } else {
+         let mut calls: Vec<(u32, ToolCall)> = tool_calls_map
+             .into_iter()
+-            .map(|(index, (id, tc_type, name, args_parts))| {
++            .map(|(index, (id, tc_type, name, args_parts, thought_signature))| {
++                let extra_content = thought_signature.as_ref().map(|s| {
++                    serde_json::json!({ "google": { "thought_signature": s } })
++                });
+                 (
+                     index,
+                     ToolCall {
+@@ -195,6 +217,8 @@ where
+                         status: None,
+                         call_id: None,
+                         operation: None,
++                        thought_signature,
++                        extra_content,
+                     },
+                 )
+             })
+diff --git a/src-tauri/src/proxy/mappers/openai/models.rs b/src-tauri/src/proxy/mappers/openai/models.rs
+index 5c800e1..cdee47c 100644
+--- a/src-tauri/src/proxy/mappers/openai/models.rs
++++ b/src-tauri/src/proxy/mappers/openai/models.rs
+@@ -128,6 +128,36 @@ pub struct ToolCall {
+     pub call_id: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub operation: Option<ApplyPatchOperation>,
++
++    // Gemini 3 thought signatures. OpenAI chat/completions has no standard
++    // field, so we emit both a top-level extra and Google's extra_content
++    // shape. Clients that round-trip unknown fields (DSH) can send them back.
++    #[serde(
++        default,
++        skip_serializing_if = "Option::is_none",
++        alias = "thoughtSignature"
++    )]
++    pub thought_signature: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub extra_content: Option<Value>,
++}
++
++impl ToolCall {
++    pub fn resolved_thought_signature(&self) -> Option<String> {
++        const MIN: usize = 50;
++        if let Some(s) = self.thought_signature.as_ref() {
++            if s.len() >= MIN {
++                return Some(s.clone());
++            }
++        }
++        self.extra_content.as_ref().and_then(|v| {
++            v.pointer("/google/thought_signature")
++                .or_else(|| v.pointer("/google/thoughtSignature"))
++                .and_then(|s| s.as_str())
++                .filter(|s| s.len() >= MIN)
++                .map(|s| s.to_string())
++        })
++    }
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+diff --git a/src-tauri/src/proxy/mappers/openai/request.rs b/src-tauri/src/proxy/mappers/openai/request.rs
+index f5533d8..8b012d2 100644
+--- a/src-tauri/src/proxy/mappers/openai/request.rs
++++ b/src-tauri/src/proxy/mappers/openai/request.rs
+@@ -375,16 +375,6 @@ pub fn transform_openai_request(
+         }
+     }
+ 
+-    // 从缓存获取当前会话的思维签名
+-    let thought_sig = session_thought_sig;
+-    if thought_sig.is_some() {
+-        tracing::debug!(
+-            "[OpenAI-Request] Using session signature (sid: {}, len: {})",
+-            session_id,
+-            thought_sig.as_ref().unwrap().len()
+-        );
+-    }
+-
+     // [New] 预先构建工具名称到原始 Schema 的映射，用于后续参数类型修正
+     let mut tool_name_to_schema = std::collections::HashMap::new();
+     if let Some(tools) = &request.tools {
+@@ -434,6 +424,10 @@ pub fn transform_openai_request(
+             };
+ 
+             let mut parts = Vec::new();
++            // Do not leak a previous turn's signature onto this message's
++            // functionCalls. Gemini 3.x treats a mismatched thought_signature
++            // as HTTP 400 Invalid; a missing one degrades tool-call quality.
++            let mut last_thought_signature: Option<String> = None;
+ 
+             // Handle reasoning_content (thinking)
+             if let Some(reasoning) = &msg.reasoning_content {
+@@ -592,7 +586,22 @@ pub fn transform_openai_request(
+                     // [New] 递归清理参数中可能存在的非法校验字段
+                     crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
+ 
+-                    if let Some(ref sig) = thought_sig {
++                    // Per-call binding only: client extra field, this tool_id,
++                    // this message index, or thinking in the same assistant
++                    // message. Never reuse the session's latest signature.
++                    let final_sig = tc
++                        .resolved_thought_signature()
++                        .or_else(|| {
++                            crate::proxy::SignatureCache::global().get_tool_signature(&tc.id)
++                        })
++                        .or_else(|| {
++                            crate::proxy::SignatureCache::global()
++                                .get_session_signature_at(&session_id, msg_index)
++                        })
++                        .or_else(|| last_thought_signature.clone());
++
++                    if let Some(sig) = final_sig {
++                        last_thought_signature = Some(sig.clone());
+                         func_call_part["thoughtSignature"] = json!(sig);
+                         func_call_part["thought_signature"] = json!(sig);
+                     } else if is_thinking_model || is_gemini_flash_thinking {
+@@ -1626,6 +1635,8 @@ mod tests {
+                     status: None,
+                     call_id: None,
+                     operation: None,
++                    thought_signature: None,
++                    extra_content: None,
+                 }]),
+                 tool_call_id: None,
+                 name: None,
+@@ -1680,6 +1691,8 @@ mod tests {
+                         status: None,
+                         call_id: None,
+                         operation: None,
++                        thought_signature: None,
++                        extra_content: None,
+                     }]),
+                     tool_call_id: None,
+                     name: None,
+@@ -1711,6 +1724,92 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn test_openai_replays_client_and_tool_cache_signatures() {
++        let sig = "client-replayed-thought-signature-value-must-be-over-fifty-chars";
++        let req = OpenAIRequest {
++            model: "gemini-3.7-flash-high".to_string(),
++            messages: vec![OpenAIMessage {
++                role: "assistant".to_string(),
++                refusal: None,
++                content: None,
++                reasoning_content: None,
++                tool_calls: Some(vec![ToolCall {
++                    id: "call_dsh_replay".to_string(),
++                    r#type: "function".to_string(),
++                    function: Some(ToolFunction {
++                        name: "bash".to_string(),
++                        arguments: "{\"command\":\"ls\"}".to_string(),
++                    }),
++                    status: None,
++                    call_id: None,
++                    operation: None,
++                    thought_signature: Some(sig.to_string()),
++                    extra_content: None,
++                }]),
++                tool_call_id: None,
++                name: None,
++            }],
++            ..Default::default()
++        };
++
++        let (result, _sid, _msg_count, _) =
++            transform_openai_request(&req, "test-proj", "gemini-3.7-flash-high", None);
++        let contents = result["request"]["contents"]
++            .as_array()
++            .expect("Should have request.contents");
++        let tool_part = contents
++            .iter()
++            .flat_map(|c| c.get("parts").and_then(|p| p.as_array()).into_iter().flatten())
++            .find(|p| p.get("functionCall").is_some())
++            .expect("Should find functionCall part");
++        assert_eq!(tool_part["thoughtSignature"].as_str(), Some(sig));
++
++        let cached_sig = "tool-cache-thought-signature-value-must-be-over-fifty-chars-xx";
++        crate::proxy::SignatureCache::global().cache_tool_signature(
++            "call_from_cache",
++            cached_sig.to_string(),
++        );
++        let req2 = OpenAIRequest {
++            model: "gemini-3.7-flash-high".to_string(),
++            messages: vec![OpenAIMessage {
++                role: "assistant".to_string(),
++                refusal: None,
++                content: None,
++                reasoning_content: None,
++                tool_calls: Some(vec![ToolCall {
++                    id: "call_from_cache".to_string(),
++                    r#type: "function".to_string(),
++                    function: Some(ToolFunction {
++                        name: "bash".to_string(),
++                        arguments: "{\"command\":\"pwd\"}".to_string(),
++                    }),
++                    status: None,
++                    call_id: None,
++                    operation: None,
++                    thought_signature: None,
++                    extra_content: None,
++                }]),
++                tool_call_id: None,
++                name: None,
++            }],
++            ..Default::default()
++        };
++        let (result2, _, _, _) =
++            transform_openai_request(&req2, "test-proj", "gemini-3.7-flash-high", None);
++        let tool_part2 = result2["request"]["contents"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .flat_map(|c| c.get("parts").and_then(|p| p.as_array()).into_iter().flatten())
++            .find(|p| p.get("functionCall").is_some())
++            .unwrap();
++        assert_eq!(
++            tool_part2["thoughtSignature"].as_str(),
++            Some(cached_sig)
++        );
++    }
++
+     #[test]
+     fn test_openai_image_thinking_mode_disabled() {
+         // 1. Set global mode to disabled
+diff --git a/src-tauri/src/proxy/mappers/openai/response.rs b/src-tauri/src/proxy/mappers/openai/response.rs
+index d611bb1..8c9510f 100644
+--- a/src-tauri/src/proxy/mappers/openai/response.rs
++++ b/src-tauri/src/proxy/mappers/openai/response.rs
+@@ -1,6 +1,6 @@
+ // OpenAI 协议响应转换模块
+ use super::models::*;
+-use serde_json::Value;
++use serde_json::{json, Value};
+ 
+ pub fn resolve_shell_tool_name(
+     model_tool_name: &str,
+@@ -76,6 +76,7 @@ pub fn transform_openai_response(
+             let mut content_out = String::new();
+             let mut thought_out = String::new();
+             let mut tool_calls = Vec::new();
++            let mut last_part_sig: Option<String> = None;
+ 
+             // 提取 content 和 tool_calls
+             if let Some(parts) = candidate
+@@ -90,6 +91,7 @@ pub fn transform_openai_response(
+                         .or(part.get("thought_signature"))
+                         .and_then(|s| s.as_str())
+                     {
++                        last_part_sig = Some(sig.to_string());
+                         if let Some(sid) = session_id {
+                             super::streaming::store_thought_signature(sig, sid, message_count);
+                         }
+@@ -168,6 +170,15 @@ pub fn transform_openai_response(
+                             .map(|s| s.to_string())
+                             .unwrap_or_else(|| format!("{}-{}", final_name, uuid::Uuid::new_v4()));
+ 
++                        let part_sig = part
++                            .get("thoughtSignature")
++                            .or(part.get("thought_signature"))
++                            .and_then(|s| s.as_str());
++                        let bound_sig = super::streaming::bind_tool_call_signature(
++                            &id,
++                            part_sig.or(last_part_sig.as_deref()),
++                        );
++
+                         tool_calls.push(ToolCall {
+                             id,
+                             r#type: "function".to_string(),
+@@ -178,6 +189,10 @@ pub fn transform_openai_response(
+                             status: None,
+                             call_id: None,
+                             operation: None,
++                            thought_signature: bound_sig.clone(),
++                            extra_content: bound_sig.as_ref().map(|s| {
++                                json!({ "google": { "thought_signature": s } })
++                            }),
+                         });
+                     }
+ 
+diff --git a/src-tauri/src/proxy/mappers/openai/streaming.rs b/src-tauri/src/proxy/mappers/openai/streaming.rs
+index 17aba0e..dc1ab5d 100644
+--- a/src-tauri/src/proxy/mappers/openai/streaming.rs
++++ b/src-tauri/src/proxy/mappers/openai/streaming.rs
+@@ -29,6 +29,21 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
+     );
+ }
+ 
++/// Bind a Gemini thought signature to the OpenAI tool_call id the client will echo.
++pub fn bind_tool_call_signature(call_id: &str, sig: Option<&str>) -> Option<String> {
++    let s = sig.filter(|v| v.len() >= 50)?;
++    crate::proxy::SignatureCache::global().cache_tool_signature(call_id, s.to_string());
++    Some(s.to_string())
++}
++
++fn tool_call_signature_extras(sig: &str) -> Value {
++    json!({
++        "thought_signature": sig,
++        "thoughtSignature": sig,
++        "extra_content": { "google": { "thought_signature": sig } }
++    })
++}
++
+ /// Extract and convert Gemini usageMetadata to OpenAI usage format
+ /// Supports both legacy v1internal format and new Interactions API format.
+ ///
+@@ -126,6 +141,7 @@ where
+         let mut final_usage: Option<super::models::OpenAIUsage> = None;
+         let mut error_occurred = false;
+         let mut tool_call_index = 0;
++        let mut last_thought_sig: Option<String> = None;
+ 
+         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+@@ -173,6 +189,7 @@ where
+                                                             }
+                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
+                                                                 store_thought_signature(sig, &session_id, message_count);
++                                                                last_thought_sig = Some(sig.to_string());
+                                                             }
+                                                             if let Some(img) = part.get("inlineData") {
+                                                                 let mime_type = img.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
+@@ -212,6 +229,21 @@ where
+                                                                     let call_id = format!("call_{:x}", hasher.finish());
+ 
+                                                                     let args_str = serde_json::to_string(&args).unwrap_or_default();
++                                                                    let part_sig = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str());
++                                                                    let bound_sig = bind_tool_call_signature(&call_id, part_sig.or(last_thought_sig.as_deref()));
++                                                                    let mut tc_obj = json!({
++                                                                        "index": tool_call_index,
++                                                                        "id": call_id,
++                                                                        "type": "function",
++                                                                        "function": { "name": final_name, "arguments": args_str }
++                                                                    });
++                                                                    if let Some(ref sig) = bound_sig {
++                                                                        if let Some(extra) = tool_call_signature_extras(sig).as_object() {
++                                                                            for (k, v) in extra {
++                                                                                tc_obj[k] = v.clone();
++                                                                            }
++                                                                        }
++                                                                    }
+                                                                     let tool_call_chunk = json!({
+                                                                         "id": &stream_id,
+                                                                         "object": "chat.completion.chunk",
+@@ -221,12 +253,7 @@ where
+                                                                             "index": idx as u32,
+                                                                             "delta": {
+                                                                                 "role": "assistant",
+-                                                                                "tool_calls": [{
+-                                                                                    "index": tool_call_index,
+-                                                                                    "id": call_id,
+-                                                                                    "type": "function",
+-                                                                                    "function": { "name": final_name, "arguments": args_str }
+-                                                                                }]
++                                                                                "tool_calls": [tc_obj]
+                                                                             },
+                                                                             "finish_reason": serde_json::Value::Null
+                                                                         }]
+@@ -796,6 +823,11 @@ where
+                                                                 use std::hash::{Hash, Hasher};
+                                                                 call_key.hash(&mut hasher);
+                                                                 let call_id = format!("call_{:x}", hasher.finish());
++                                                                let part_sig = part
++                                                                    .get("thoughtSignature")
++                                                                    .or(part.get("thought_signature"))
++                                                                    .and_then(|s| s.as_str());
++                                                                bind_tool_call_signature(&call_id, part_sig);
+ 
+                                                                 let (actual_name, namespace) = split_namespace_tool_name(name);
+                                                                 let tool_item_id = format!("item-{}", &Uuid::new_v4().to_string()[..16]);
+diff --git a/src-tauri/src/proxy/signature_cache.rs b/src-tauri/src/proxy/signature_cache.rs
+index 292af75..647f617 100644
+--- a/src-tauri/src/proxy/signature_cache.rs
++++ b/src-tauri/src/proxy/signature_cache.rs
+@@ -2,8 +2,12 @@ use std::collections::HashMap;
+ use std::sync::{Mutex, OnceLock};
+ use std::time::{Duration, SystemTime};
+ 
+-// Node.js proxy uses 2 hours TTL
+-const SIGNATURE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
++// Family cache: short TTL is enough to catch cross-model reuse.
++const FAMILY_TTL: Duration = Duration::from_secs(2 * 60 * 60);
++// Tool/session replay: OpenAI clients (DSH etc.) do not always echo
++// thought_signature. 2h expiry dropped a live Gemini 3.7 Flash session
++// after a few hours idle and the model then emitted malformed tool args.
++const REPLAY_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+ const MIN_SIGNATURE_LENGTH: usize = 50;
+ 
+ // Different cache limits for different layers
+@@ -34,7 +38,11 @@ impl<T> CacheEntry<T> {
+     }
+ 
+     fn is_expired(&self) -> bool {
+-        self.timestamp.elapsed().unwrap_or(Duration::ZERO) > SIGNATURE_TTL
++        self.timestamp.elapsed().unwrap_or(Duration::ZERO) > FAMILY_TTL
++    }
++
++    fn is_replay_expired(&self) -> bool {
++        self.timestamp.elapsed().unwrap_or(Duration::ZERO) > REPLAY_TTL
+     }
+ }
+ 
+@@ -97,7 +105,7 @@ impl SignatureCache {
+             // Clean up expired entries when limit is reached
+             if cache.len() > TOOL_CACHE_LIMIT {
+                 let before = cache.len();
+-                cache.retain(|_, v| !v.is_expired());
++                cache.retain(|_, v| !v.is_replay_expired());
+                 let after = cache.len();
+                 if before != after {
+                     tracing::debug!(
+@@ -114,7 +122,7 @@ impl SignatureCache {
+     pub fn get_tool_signature(&self, tool_use_id: &str) -> Option<String> {
+         if let Ok(cache) = self.tool_signatures.lock() {
+             if let Some(entry) = cache.get(tool_use_id) {
+-                if !entry.is_expired() {
++                if !entry.is_replay_expired() {
+                     tracing::debug!(
+                         "[SignatureCache] Hit tool signature for id: {}",
+                         tool_use_id
+@@ -239,7 +247,7 @@ impl SignatureCache {
+             // Cleanup when limit is reached (Session cache has largest limit)
+             if cache.len() > SESSION_CACHE_LIMIT {
+                 let before = cache.len();
+-                cache.retain(|_, v| !v.is_expired());
++                cache.retain(|_, v| !v.is_replay_expired());
+                 let after = cache.len();
+                 if before != after {
+                     tracing::info!(
+@@ -258,7 +266,7 @@ impl SignatureCache {
+     pub fn get_session_signature(&self, session_id: &str) -> Option<String> {
+         if let Ok(cache) = self.session_signatures.lock() {
+             if let Some(entry) = cache.get(session_id) {
+-                if !entry.is_expired() {
++                if !entry.is_replay_expired() {
+                     // Find the signature with the maximum message_count (the latest one)
+                     if let Some(sig_entry) = entry.data.values().max_by_key(|e| e.message_count) {
+                         tracing::debug!(
+@@ -286,7 +294,7 @@ impl SignatureCache {
+     ) -> Option<String> {
+         if let Ok(cache) = self.session_signatures.lock() {
+             if let Some(entry) = cache.get(session_id) {
+-                if !entry.is_expired() {
++                if !entry.is_replay_expired() {
+                     if let Some(sig_entry) = entry.data.get(&message_count) {
+                         tracing::debug!(
+                             "[SignatureCache] Session {} (msg_count={}) -> HIT (len={})",

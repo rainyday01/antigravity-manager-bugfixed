@@ -26,8 +26,9 @@ where
     let mut content_parts: Vec<String> = Vec::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut finish_reason: Option<String> = None;
-    // Tool calls aggregation: index -> (id, type, name, arguments_parts)
-    let mut tool_calls_map: HashMap<u32, (String, String, String, Vec<String>)> = HashMap::new();
+    // Tool calls aggregation: index -> (id, type, name, arguments_parts, thought_signature)
+    let mut tool_calls_map: HashMap<u32, (String, String, String, Vec<String>, Option<String>)> =
+        HashMap::new();
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
@@ -123,6 +124,7 @@ where
                                                     String::from("function"),
                                                     String::new(),
                                                     Vec::new(),
+                                                    None,
                                                 )
                                             });
 
@@ -154,6 +156,23 @@ where
                                                 entry.3.push(args.to_string());
                                             }
                                         }
+
+                                        let incoming_sig = tc
+                                            .get("thought_signature")
+                                            .or(tc.get("thoughtSignature"))
+                                            .and_then(|v| v.as_str())
+                                            .or_else(|| {
+                                                tc.get("extra_content")
+                                                    .and_then(|v| {
+                                                        v.pointer("/google/thought_signature")
+                                                    })
+                                                    .and_then(|v| v.as_str())
+                                            });
+                                        if let Some(sig) = incoming_sig {
+                                            if sig.len() >= 50 {
+                                                entry.4 = Some(sig.to_string());
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -182,7 +201,10 @@ where
     } else {
         let mut calls: Vec<(u32, ToolCall)> = tool_calls_map
             .into_iter()
-            .map(|(index, (id, tc_type, name, args_parts))| {
+            .map(|(index, (id, tc_type, name, args_parts, thought_signature))| {
+                let extra_content = thought_signature.as_ref().map(|s| {
+                    serde_json::json!({ "google": { "thought_signature": s } })
+                });
                 (
                     index,
                     ToolCall {
@@ -195,6 +217,8 @@ where
                         status: None,
                         call_id: None,
                         operation: None,
+                        thought_signature,
+                        extra_content,
                     },
                 )
             })
