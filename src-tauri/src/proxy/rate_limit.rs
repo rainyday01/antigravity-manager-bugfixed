@@ -1,6 +1,20 @@
 use dashmap::DashMap;
 use regex::Regex;
-use std::time::{Duration, SystemTime};
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
+
+/// Local pre-Google pacing: stay under consumer RPM so we never poke
+/// RESOURCE_EXHAUSTED. 10/min + 2s spacing is below typical Antigravity
+/// consumer bursts; after a real 429 we lock 75s (Google's window is 60s).
+const PACE_WINDOW: Duration = Duration::from_secs(60);
+const PACE_MAX_RPM: usize = 10;
+const PACE_MIN_INTERVAL: Duration = Duration::from_millis(2000);
+const RPM_TRIP_LOCKOUT_SECS: u64 = 75;
+
+struct PaceWindow {
+    sends: VecDeque<Instant>,
+}
 
 /// 限流原因类型
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -46,6 +60,8 @@ pub struct RateLimitTracker {
     limits: DashMap<String, RateLimitInfo>,
     /// 连续失败计数（用于智能指数退避），带时间戳用于自动过期
     failure_counts: DashMap<String, (u32, SystemTime)>,
+    /// Per-account sliding window of dispatches we already sent upstream.
+    pace: DashMap<String, Mutex<PaceWindow>>,
 }
 
 impl RateLimitTracker {
@@ -53,6 +69,7 @@ impl RateLimitTracker {
         Self {
             limits: DashMap::new(),
             failure_counts: DashMap::new(),
+            pace: DashMap::new(),
         }
     }
 
@@ -67,14 +84,15 @@ impl RateLimitTracker {
     }
 
     /// 获取账号剩余的等待时间(秒)
-    /// 支持检查账号级和模型级锁
+    /// 支持检查账号级和模型级锁，并叠加本地上游节奏（未打到 Google 的预限流）。
     pub fn get_remaining_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
         let now = SystemTime::now();
+        let mut wait = 0u64;
 
         // 1. 检查全局账号锁
         if let Some(info) = self.limits.get(account_id) {
             if info.reset_time > now {
-                return info
+                wait = info
                     .reset_time
                     .duration_since(now)
                     .unwrap_or(Duration::from_secs(0))
@@ -87,16 +105,82 @@ impl RateLimitTracker {
             let key = self.get_limit_key(account_id, Some(m));
             if let Some(info) = self.limits.get(&key) {
                 if info.reset_time > now {
-                    return info
-                        .reset_time
-                        .duration_since(now)
-                        .unwrap_or(Duration::from_secs(0))
-                        .as_secs();
+                    wait = wait.max(
+                        info.reset_time
+                            .duration_since(now)
+                            .unwrap_or(Duration::from_secs(0))
+                            .as_secs(),
+                    );
                 }
             }
         }
 
-        0
+        wait.max(self.pace_wait_secs(account_id))
+    }
+
+    fn lock_mutex<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn prune_pace(sends: &mut VecDeque<Instant>, now: Instant) {
+        while sends
+            .front()
+            .map(|t| now.duration_since(*t) >= PACE_WINDOW)
+            .unwrap_or(false)
+        {
+            sends.pop_front();
+        }
+    }
+
+    /// Seconds until this account may send another request to Google.
+    /// Combines min-interval and sliding RPM. 0 means the next call is allowed.
+    pub fn pace_wait_secs(&self, account_id: &str) -> u64 {
+        let now = Instant::now();
+        let Some(entry) = self.pace.get(account_id) else {
+            return 0;
+        };
+        let mut window = Self::lock_mutex(entry.value());
+        Self::prune_pace(&mut window.sends, now);
+
+        let mut wait = Duration::ZERO;
+        if let Some(last) = window.sends.back() {
+            if let Some(remain) = PACE_MIN_INTERVAL.checked_sub(now.duration_since(*last)) {
+                wait = remain;
+            }
+        }
+        if window.sends.len() >= PACE_MAX_RPM {
+            if let Some(oldest) = window.sends.front() {
+                let until = *oldest + PACE_WINDOW;
+                if until > now {
+                    wait = wait.max(until.saturating_duration_since(now));
+                }
+            }
+        }
+        if wait.is_zero() {
+            0
+        } else {
+            wait.as_secs().max(1)
+        }
+    }
+
+    /// Record that we are about to hit Google with this account.
+    pub fn record_dispatch(&self, account_id: &str) {
+        let now = Instant::now();
+        let entry = self.pace.entry(account_id.to_string()).or_insert_with(|| {
+            Mutex::new(PaceWindow {
+                sends: VecDeque::new(),
+            })
+        });
+        let mut window = Self::lock_mutex(entry.value());
+        Self::prune_pace(&mut window.sends, now);
+        window.sends.push_back(now);
+        tracing::info!(
+            "[Upstream-Pace] account {} dispatch {}/{} in 60s (min interval {}ms)",
+            account_id,
+            window.sends.len(),
+            PACE_MAX_RPM,
+            PACE_MIN_INTERVAL.as_millis()
+        );
     }
 
     /// 标记账号请求成功，重置连续失败计数
@@ -315,14 +399,15 @@ impl RateLimitTracker {
                         lockout
                     }
                     RateLimitReason::RateLimitExceeded => {
-                        // 速率限制 (TPM/RPM)
+                        // 速率限制 (TPM/RPM)。Google 窗口是 60s；锁 30s 会在窗口还热时
+                        // 立刻再打上去，把 429 续上。锁满一个窗口再加余量。
                         let body_lower = body.to_lowercase();
                         let lockout = if body_lower.contains("resource has been exhausted")
                             || body_lower.contains("resource_exhausted")
                         {
-                            30
+                            RPM_TRIP_LOCKOUT_SECS
                         } else {
-                            5
+                            15
                         };
                         tracing::debug!(
                             "检测到速率限制 (RATE_LIMIT_EXCEEDED)，使用默认值 {}秒",
@@ -819,5 +904,52 @@ mod tests {
         // 第 4 次 429 → 7200 秒
         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
         assert_eq!(info.unwrap().retry_after_sec, 7200);
+    }
+
+    #[test]
+    fn test_upstream_pace_min_interval_blocks_second_dispatch() {
+        let tracker = RateLimitTracker::new();
+        assert_eq!(tracker.pace_wait_secs("acc-pace"), 0);
+        tracker.record_dispatch("acc-pace");
+        let wait = tracker.pace_wait_secs("acc-pace");
+        assert!(
+            wait >= 1,
+            "second dispatch inside min interval must wait, got {wait}"
+        );
+        assert!(tracker.is_rate_limited("acc-pace", None));
+    }
+
+    #[test]
+    fn test_upstream_pace_rpm_cap() {
+        let tracker = RateLimitTracker::new();
+        for _ in 0..PACE_MAX_RPM {
+            tracker.record_dispatch("acc-rpm");
+        }
+        let wait = tracker.pace_wait_secs("acc-rpm");
+        assert!(
+            wait >= 1,
+            "dispatch after RPM cap must wait for the 60s window, got {wait}"
+        );
+    }
+
+    #[test]
+    fn test_resource_exhausted_lockout_covers_google_minute_window() {
+        let tracker = RateLimitTracker::new();
+        let body = r#"{
+            "error": {
+                "code": 429,
+                "message": "Resource has been exhausted (e.g. check quota).",
+                "status": "RESOURCE_EXHAUSTED"
+            }
+        }"#;
+        let info = tracker
+            .parse_from_error("acc-rpm-trip", 429, None, body, None, &[])
+            .expect("lockout");
+        assert_eq!(info.retry_after_sec, RPM_TRIP_LOCKOUT_SECS);
+        let wait = tracker.get_remaining_wait("acc-rpm-trip", None);
+        assert!(
+            wait >= 70 && wait <= RPM_TRIP_LOCKOUT_SECS,
+            "lockout should cover Google's 60s RPM window, got {wait}"
+        );
     }
 }

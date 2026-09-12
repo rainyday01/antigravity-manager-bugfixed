@@ -173,6 +173,31 @@ pub fn get_signature_family(signature: &str) -> Option<String> {
 }
 
 /// [CRITICAL] Sanitize thinking blocks and check cross-model compatibility
+/// Gemini 3.x Flash signatures are interchangeable across patch versions
+/// (3.5 / 3.7 / 3.8). Exact model-id mismatch must not drop a valid
+/// thought_signature — that is the Invalid-signature 400 we hit on 3.7.
+fn thinking_families_compatible(origin: &str, target: &str) -> bool {
+    if origin == target {
+        return true;
+    }
+    let o = origin.to_lowercase();
+    let t = target.to_lowercase();
+    if o == t {
+        return true;
+    }
+    let o_flash = o.contains("gemini") && o.contains("flash");
+    let t_flash = t.contains("gemini") && t.contains("flash");
+    if o_flash && t_flash && o.contains("gemini-3") && t.contains("gemini-3") {
+        return true;
+    }
+    let o_pro = o.contains("gemini") && o.contains("pro") && !o_flash;
+    let t_pro = t.contains("gemini") && t.contains("pro") && !t_flash;
+    if o_pro && t_pro && o.contains("gemini-3") && t.contains("gemini-3") {
+        return true;
+    }
+    false
+}
+
 pub fn filter_invalid_thinking_blocks_with_family(
     messages: &mut [Message],
     target_family: Option<&str>,
@@ -201,7 +226,7 @@ pub fn filter_invalid_thinking_blocks_with_family(
                     // 2. Family compatibility check (Prevents SONNET-Thinking sig being sent to OPUS-Thinking)
                     if let Some(target) = target_family {
                         if let Some(origin_family) = get_signature_family(sig) {
-                            if origin_family != target {
+                            if !thinking_families_compatible(&origin_family, target) {
                                 warn!("[Thinking-Sanitizer] Dropping signature from family '{}' for target '{}'", origin_family, target);
                                 stripped_count += 1;
                                 return false;
@@ -291,5 +316,16 @@ mod tests {
             }
             _ => panic!("expected remaining content"),
         }
+    }
+
+    #[test]
+    fn sanitizer_keeps_gemini_3_flash_across_patch_versions() {
+        SignatureCache::global().clear();
+        let sig = "c".repeat(80);
+        SignatureCache::global()
+            .cache_thinking_family(sig.clone(), "gemini-3.7-flash-high".to_string());
+        let mut messages = vec![thinking_msg(&sig)];
+        filter_invalid_thinking_blocks_with_family(&mut messages, Some("gemini-3.8-flash-high"));
+        assert_eq!(thinking_sig(&messages).as_deref(), Some(sig.as_str()));
     }
 }

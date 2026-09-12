@@ -1,0 +1,874 @@
+diff --git a/src-tauri/src/proxy/common/model_mapping.rs b/src-tauri/src/proxy/common/model_mapping.rs
+index bb2114a..c26ab6f 100644
+--- a/src-tauri/src/proxy/common/model_mapping.rs
++++ b/src-tauri/src/proxy/common/model_mapping.rs
+@@ -84,6 +84,16 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
+     m.insert("gemini-3-pro", "gemini-3-pro-preview");
+     m.insert("gemini-2.5-flash", "gemini-2.5-flash");
+     m.insert("gemini-3-flash", "gemini-3-flash");
++    m.insert("gemini-3.7-flash", "gemini-3.7-flash");
++    m.insert("gemini-3.7-flash-tiered", "gemini-3.7-flash-tiered");
++    m.insert("gemini-3.7-flash-low", "gemini-3.7-flash-low");
++    m.insert("gemini-3.7-flash-medium", "gemini-3.7-flash-medium");
++    m.insert("gemini-3.7-flash-high", "gemini-3.7-flash-high");
++    m.insert("gemini-3.8-flash", "gemini-3.8-flash");
++    m.insert("gemini-3.8-flash-tiered", "gemini-3.8-flash-tiered");
++    m.insert("gemini-3.8-flash-low", "gemini-3.8-flash-low");
++    m.insert("gemini-3.8-flash-medium", "gemini-3.8-flash-medium");
++    m.insert("gemini-3.8-flash-high", "gemini-3.8-flash-high");
+     m.insert("gemini-3-pro-image", "gemini-3-pro-image");
+ 
+     // [New] Unified Virtual ID for Background Tasks (Title, Summary, etc.)
+@@ -192,6 +202,10 @@ pub async fn get_all_dynamic_models(
+         model_ids.insert("gemini-2.0-flash-exp".to_string());
+         model_ids.insert("gemini-2.5-flash".to_string());
+         model_ids.insert("gemini-3-flash".to_string());
++        model_ids.insert("gemini-3.7-flash".to_string());
++        model_ids.insert("gemini-3.7-flash-high".to_string());
++        model_ids.insert("gemini-3.8-flash".to_string());
++        model_ids.insert("gemini-3.8-flash-high".to_string());
+         model_ids.insert("gemini-3.1-pro-high".to_string());
+         model_ids.insert("gemini-3.1-pro-low".to_string());
+     }
+diff --git a/src-tauri/src/proxy/common/variant_mapping.rs b/src-tauri/src/proxy/common/variant_mapping.rs
+index 8321a0b..43839bd 100644
+--- a/src-tauri/src/proxy/common/variant_mapping.rs
++++ b/src-tauri/src/proxy/common/variant_mapping.rs
+@@ -167,6 +167,52 @@ pub fn resolve(canonical: &str, budget_tokens: Option<u32>) -> Option<RealModelS
+ }
+ 
+ // ── verified real model specs (from upstream spec) ──
++// gemini-3.8-flash family — same tier budgets as 3.7 Flash (Google: LOW/MEDIUM/HIGH, 64k out)
++const SPEC_38_FLASH_LOW: RealModelSpec = RealModelSpec {
++    id: "gemini-3.8-flash-low",
++    thinking_budget: 1000,
++    max_output_tokens: 65536,
++    include_thoughts: true,
++    preserve_client_budget: false,
++};
++const SPEC_38_FLASH_MEDIUM: RealModelSpec = RealModelSpec {
++    id: "gemini-3.8-flash-medium",
++    thinking_budget: 4000,
++    max_output_tokens: 65536,
++    include_thoughts: true,
++    preserve_client_budget: false,
++};
++const SPEC_38_FLASH_HIGH: RealModelSpec = RealModelSpec {
++    id: "gemini-3.8-flash-high",
++    thinking_budget: 10000,
++    max_output_tokens: 65536,
++    include_thoughts: true,
++    preserve_client_budget: false,
++};
++
++// gemini-3.7-flash family (maxOutputTokens = 65536)
++const SPEC_37_FLASH_LOW: RealModelSpec = RealModelSpec {
++    id: "gemini-3.7-flash-low",
++    thinking_budget: 1000,
++    max_output_tokens: 65536,
++    include_thoughts: true,
++    preserve_client_budget: false,
++};
++const SPEC_37_FLASH_MEDIUM: RealModelSpec = RealModelSpec {
++    id: "gemini-3.7-flash-medium",
++    thinking_budget: 4000,
++    max_output_tokens: 65536,
++    include_thoughts: true,
++    preserve_client_budget: false,
++};
++const SPEC_37_FLASH_HIGH: RealModelSpec = RealModelSpec {
++    id: "gemini-3.7-flash-high",
++    thinking_budget: 10000,
++    max_output_tokens: 65536,
++    include_thoughts: true,
++    preserve_client_budget: false,
++};
++
+ // gemini-3.5-flash family (maxOutputTokens = 65536)
+ const SPEC_35_FLASH_EXTRA_LOW: RealModelSpec = RealModelSpec {
+     id: "gemini-3.5-flash-extra-low",
+@@ -237,6 +283,60 @@ const SPEC_GPT_OSS_120B: RealModelSpec = RealModelSpec {
+ };
+ 
+ pub static GEMINI_FAMILIES: &[CanonicalFamily] = &[
++    CanonicalFamily {
++        canonical_id: "gemini-3.8-flash",
++        display_name: "Gemini 3.8 Flash",
++        context_limit: 1_000_000,
++        output_limit: 65_536,
++        input_modalities: &["text", "image", "audio", "video", "pdf"],
++        output_modalities: &["text"],
++        reasoning: true,
++        tiers: &[
++            (VariantTier::Low, SPEC_38_FLASH_LOW),
++            (VariantTier::Medium, SPEC_38_FLASH_MEDIUM),
++            (VariantTier::High, SPEC_38_FLASH_HIGH),
++        ],
++        aliases: &[
++            ("gemini-3.8-flash-high", AliasPolicy::HonorTier),
++            (
++                "gemini-3.8-flash-medium",
++                AliasPolicy::Fixed(VariantTier::Medium),
++            ),
++            ("gemini-3.8-flash-low", AliasPolicy::Fixed(VariantTier::Low)),
++            ("gemini-3.8-flash-tiered", AliasPolicy::HonorTier),
++        ],
++    },
++    CanonicalFamily {
++        canonical_id: "gemini-3.7-flash",
++        display_name: "Gemini 3.7 Flash",
++        context_limit: 1_000_000,
++        output_limit: 65_536,
++        input_modalities: &["text", "image", "audio", "video", "pdf"],
++        output_modalities: &["text"],
++        reasoning: true,
++        tiers: &[
++            (VariantTier::Low, SPEC_37_FLASH_LOW),
++            (VariantTier::Medium, SPEC_37_FLASH_MEDIUM),
++            (VariantTier::High, SPEC_37_FLASH_HIGH),
++        ],
++        aliases: &[
++            ("gemini-3.7-flash-high", AliasPolicy::HonorTier),
++            (
++                "gemini-3.7-flash-medium",
++                AliasPolicy::Fixed(VariantTier::Medium),
++            ),
++            ("gemini-3.7-flash-low", AliasPolicy::Fixed(VariantTier::Low)),
++            ("gemini-3.7-flash-tiered", AliasPolicy::HonorTier),
++            ("gemini-3.6-flash-high", AliasPolicy::HonorTier),
++            (
++                "gemini-3.6-flash-medium",
++                AliasPolicy::Fixed(VariantTier::Medium),
++            ),
++            ("gemini-3.6-flash-low", AliasPolicy::Fixed(VariantTier::Low)),
++            ("gemini-3.6-flash", AliasPolicy::HonorTier),
++            ("gemini-3.6-flash-tiered", AliasPolicy::HonorTier),
++        ],
++    },
+     CanonicalFamily {
+         canonical_id: "gemini-3.5-flash",
+         display_name: "Gemini 3.5 Flash",
+@@ -341,6 +441,48 @@ mod tests {
+         assert_eq!(s.thinking_budget, 1000);
+     }
+ 
++    #[test]
++    fn test_resolve_37_flash_variants() {
++        let s = resolve("gemini-3.7-flash", None).unwrap();
++        assert_eq!(s.id, "gemini-3.7-flash-high");
++        assert_eq!(s.thinking_budget, 10000);
++        assert_eq!(s.max_output_tokens, 65536);
++
++        let s = resolve("gemini-3.7-flash-medium", None).unwrap();
++        assert_eq!(s.id, "gemini-3.7-flash-medium");
++        assert_eq!(s.thinking_budget, 4000);
++
++        let s = resolve("gemini-3.7-flash-low", None).unwrap();
++        assert_eq!(s.id, "gemini-3.7-flash-low");
++        assert_eq!(s.thinking_budget, 1000);
++
++        let s = resolve("gemini-3.7-flash-tiered", Some(1000)).unwrap();
++        assert_eq!(s.id, "gemini-3.7-flash-low");
++    }
++
++    #[test]
++    fn test_resolve_38_flash_variants() {
++        let s = resolve("gemini-3.8-flash", None).unwrap();
++        assert_eq!(s.id, "gemini-3.8-flash-high");
++        assert_eq!(s.thinking_budget, 10000);
++        assert_eq!(s.max_output_tokens, 65536);
++        assert!(s.include_thoughts);
++
++        let s = resolve("gemini-3.8-flash-medium", None).unwrap();
++        assert_eq!(s.id, "gemini-3.8-flash-medium");
++        assert_eq!(s.thinking_budget, 4000);
++
++        let s = resolve("gemini-3.8-flash-low", None).unwrap();
++        assert_eq!(s.id, "gemini-3.8-flash-low");
++        assert_eq!(s.thinking_budget, 1000);
++
++        let s = resolve("gemini-3.8-flash-tiered", Some(1000)).unwrap();
++        assert_eq!(s.id, "gemini-3.8-flash-low");
++
++        let s = resolve("gemini-3.8-flash-high", Some(1000)).unwrap();
++        assert_eq!(s.id, "gemini-3.8-flash-low");
++    }
++
+     #[test]
+     fn tier_from_effort_accepts_only_anthropic_sdk_values() {
+         assert_eq!(tier_from_effort(Some("low")), Some(VariantTier::Low));
+diff --git a/src-tauri/src/proxy/mappers/claude/request.rs b/src-tauri/src/proxy/mappers/claude/request.rs
+index d4b6385..4d032ab 100644
+--- a/src-tauri/src/proxy/mappers/claude/request.rs
++++ b/src-tauri/src/proxy/mappers/claude/request.rs
+@@ -8,6 +8,24 @@ use crate::proxy::session_manager::SessionManager;
+ use serde_json::{json, Value};
+ use std::collections::HashMap;
+ 
++const CLAUDE_AGENT_SDK_IDENTITY: &str =
++    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
++const CLAUDE_CODE_CLI_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
++
++/// Normalize the standalone identity block injected by Claude Agent SDK clients.
++///
++/// Antigravity's upstream currently classifies this SDK identity differently from
++/// Claude Code's CLI identity and can reject an otherwise identical request with
++/// RESOURCE_EXHAUSTED. Keep the match exact so user-authored text that merely
++/// mentions the SDK identity is not rewritten.
++fn normalize_claude_client_identity(text: &str) -> &str {
++    if text == CLAUDE_AGENT_SDK_IDENTITY {
++        CLAUDE_CODE_CLI_IDENTITY
++    } else {
++        text
++    }
++}
++
+ // ===== Safety Settings Configuration =====
+ 
+ /// Safety threshold levels for Gemini API
+@@ -935,13 +953,15 @@ fn build_system_instruction(
+             SystemPrompt::String(text) => {
+                 // [MODIFIED] No longer filter "You are an interactive CLI tool"
+                 // We pass everything through to ensure Flash/Lite models get full instructions
+-                parts.push(json!({"text": text}));
++                parts.push(json!({"text": normalize_claude_client_identity(text)}));
+             }
+             SystemPrompt::Array(blocks) => {
+                 for block in blocks {
+                     if block.block_type == "text" {
+                         // [MODIFIED] No longer filter "You are an interactive CLI tool"
+-                        parts.push(json!({"text": block.text}));
++                        parts.push(json!({
++                            "text": normalize_claude_client_identity(&block.text)
++                        }));
+                     }
+                 }
+             }
+@@ -2171,6 +2191,25 @@ fn is_model_compatible(cached: &str, target: &str) -> bool {
+     if c.contains("gemini-2.0-pro") && t.contains("gemini-2.0-pro") {
+         return true;
+     }
++    // Gemini 3.x Flash signatures are interchangeable across 3 / 3.5 / 3.6 / 3.7 / 3.8
++    // patch versions. Reusing a 3.7-flash-high signature on 3.8-flash-high must not
++    // be treated as a family miss (that path used to stamp skip / latest and hit
++    // Invalid thought signature).
++    if c.contains("gemini-3") && t.contains("gemini-3") {
++        let c_flash = c.contains("flash");
++        let t_flash = t.contains("flash");
++        let c_pro = c.contains("pro");
++        let t_pro = t.contains("pro");
++        if c_flash == t_flash && c_pro == t_pro {
++            return true;
++        }
++        if c_flash && t_flash {
++            return true;
++        }
++        if c_pro && t_pro {
++            return true;
++        }
++    }
+ 
+     // Fallback: strict match required
+     false
+@@ -2182,6 +2221,51 @@ mod tests {
+     use crate::proxy::common::json_schema::clean_json_schema;
+     use crate::proxy::config::{update_thinking_budget_config, ThinkingBudgetConfig};
+ 
++    #[test]
++    fn test_agent_sdk_identity_is_normalized_for_antigravity() {
++        let req: ClaudeRequest = serde_json::from_value(json!({
++            "model": "claude-sonnet-4-6",
++            "messages": [{"role": "user", "content": "Reply with ok"}],
++            "system": [
++                {
++                    "type": "text",
++                    "text": "x-anthropic-billing-header: cc_entrypoint=sdk-cli;"
++                },
++                {
++                    "type": "text",
++                    "text": CLAUDE_AGENT_SDK_IDENTITY,
++                    "cache_control": {"type": "ephemeral"}
++                }
++            ]
++        }))
++        .expect("Agent SDK request should deserialize");
++
++        let body =
++            transform_claude_request_in(&req, "test-project", false, None, "test-session", None)
++                .expect("Agent SDK request should transform");
++        let system_parts = body["request"]["systemInstruction"]["parts"]
++            .as_array()
++            .expect("system instruction should contain parts");
++        let system_texts = system_parts
++            .iter()
++            .filter_map(|part| part["text"].as_str())
++            .collect::<Vec<_>>();
++
++        assert!(system_texts.contains(&CLAUDE_CODE_CLI_IDENTITY));
++        assert!(!system_texts.contains(&CLAUDE_AGENT_SDK_IDENTITY));
++        assert!(system_texts.contains(&"x-anthropic-billing-header: cc_entrypoint=sdk-cli;"));
++    }
++
++    #[test]
++    fn test_agent_sdk_identity_mention_is_not_rewritten() {
++        let quoted_identity = format!("Compatibility note: {CLAUDE_AGENT_SDK_IDENTITY}");
++
++        assert_eq!(
++            normalize_claude_client_identity(&quoted_identity),
++            quoted_identity
++        );
++    }
++
+     #[test]
+     fn test_ephemeral_injection_debug() {
+         // This test simulates the issue where cache_control might be injected
+@@ -3232,6 +3316,8 @@ mod tests {
+         assert!(model_keeps_thinking_without_signature("gemini-3-flash"));
+         assert!(model_keeps_thinking_without_signature("gemini-3.1-flash"));
+         assert!(model_keeps_thinking_without_signature("gemini-3.7-flash-high"));
++        assert!(model_keeps_thinking_without_signature("gemini-3.8-flash-high"));
++        assert!(model_keeps_thinking_without_signature("gemini-3.8-flash"));
+         assert!(model_keeps_thinking_without_signature(
+             "gemini-3.6-flash-medium"
+         ));
+@@ -3242,4 +3328,21 @@ mod tests {
+             "gemini-3.1-pro-preview"
+         ));
+     }
++
++    #[test]
++    fn test_gemini_3_flash_signatures_are_cross_version_compatible() {
++        assert!(is_model_compatible(
++            "gemini-3.7-flash-high",
++            "gemini-3.8-flash-high"
++        ));
++        assert!(is_model_compatible(
++            "gemini-3.8-flash-low",
++            "gemini-3.5-flash-low"
++        ));
++        assert!(is_model_compatible("gemini-3-flash", "gemini-3.8-flash"));
++        assert!(!is_model_compatible(
++            "gemini-3.8-flash-high",
++            "gemini-3.1-pro-high"
++        ));
++    }
+ }
+diff --git a/src-tauri/src/proxy/mappers/claude/thinking_utils.rs b/src-tauri/src/proxy/mappers/claude/thinking_utils.rs
+index d65717d..ae8dfc9 100644
+--- a/src-tauri/src/proxy/mappers/claude/thinking_utils.rs
++++ b/src-tauri/src/proxy/mappers/claude/thinking_utils.rs
+@@ -173,6 +173,31 @@ pub fn get_signature_family(signature: &str) -> Option<String> {
+ }
+ 
+ /// [CRITICAL] Sanitize thinking blocks and check cross-model compatibility
++/// Gemini 3.x Flash signatures are interchangeable across patch versions
++/// (3.5 / 3.7 / 3.8). Exact model-id mismatch must not drop a valid
++/// thought_signature — that is the Invalid-signature 400 we hit on 3.7.
++fn thinking_families_compatible(origin: &str, target: &str) -> bool {
++    if origin == target {
++        return true;
++    }
++    let o = origin.to_lowercase();
++    let t = target.to_lowercase();
++    if o == t {
++        return true;
++    }
++    let o_flash = o.contains("gemini") && o.contains("flash");
++    let t_flash = t.contains("gemini") && t.contains("flash");
++    if o_flash && t_flash && o.contains("gemini-3") && t.contains("gemini-3") {
++        return true;
++    }
++    let o_pro = o.contains("gemini") && o.contains("pro") && !o_flash;
++    let t_pro = t.contains("gemini") && t.contains("pro") && !t_flash;
++    if o_pro && t_pro && o.contains("gemini-3") && t.contains("gemini-3") {
++        return true;
++    }
++    false
++}
++
+ pub fn filter_invalid_thinking_blocks_with_family(
+     messages: &mut [Message],
+     target_family: Option<&str>,
+@@ -201,7 +226,7 @@ pub fn filter_invalid_thinking_blocks_with_family(
+                     // 2. Family compatibility check (Prevents SONNET-Thinking sig being sent to OPUS-Thinking)
+                     if let Some(target) = target_family {
+                         if let Some(origin_family) = get_signature_family(sig) {
+-                            if origin_family != target {
++                            if !thinking_families_compatible(&origin_family, target) {
+                                 warn!("[Thinking-Sanitizer] Dropping signature from family '{}' for target '{}'", origin_family, target);
+                                 stripped_count += 1;
+                                 return false;
+@@ -292,4 +317,15 @@ mod tests {
+             _ => panic!("expected remaining content"),
+         }
+     }
++
++    #[test]
++    fn sanitizer_keeps_gemini_3_flash_across_patch_versions() {
++        SignatureCache::global().clear();
++        let sig = "c".repeat(80);
++        SignatureCache::global()
++            .cache_thinking_family(sig.clone(), "gemini-3.7-flash-high".to_string());
++        let mut messages = vec![thinking_msg(&sig)];
++        filter_invalid_thinking_blocks_with_family(&mut messages, Some("gemini-3.8-flash-high"));
++        assert_eq!(thinking_sig(&messages).as_deref(), Some(sig.as_str()));
++    }
+ }
+diff --git a/src-tauri/src/proxy/mappers/openai/request.rs b/src-tauri/src/proxy/mappers/openai/request.rs
+index 8b012d2..482e942 100644
+--- a/src-tauri/src/proxy/mappers/openai/request.rs
++++ b/src-tauri/src/proxy/mappers/openai/request.rs
+@@ -112,6 +112,45 @@ fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str) -> String
+     format!("{}__{}", ns, child)
+ }
+ 
++/// DSH/Codex shell tools mark both `command` and `description` as required.
++/// Gemini 3.x then often fills the natural-language `description` slot and
++/// omits `command`, which the client rejects (`missing required property
++/// "command"`). Keep `command` required and first; leave UI `description`
++/// optional so Gemini can still send it.
++fn sanitize_shell_command_schema(tool_name: &str, params: &mut Value) {
++    let is_shell = matches!(
++        tool_name,
++        "bash" | "shell" | "local_shell" | "local_shell_call"
++    );
++    if !is_shell {
++        return;
++    }
++    let Some(obj) = params.as_object_mut() else {
++        return;
++    };
++    let has_command = obj
++        .get("properties")
++        .and_then(|p| p.as_object())
++        .map(|p| p.contains_key("command"))
++        .unwrap_or(false);
++    if !has_command {
++        return;
++    }
++    if let Some(Value::Object(props)) = obj.get_mut("properties") {
++        let mut ordered = serde_json::Map::new();
++        if let Some(cmd) = props.get("command").cloned() {
++            ordered.insert("command".to_string(), cmd);
++        }
++        for (k, v) in props.iter() {
++            if k != "command" {
++                ordered.insert(k.clone(), v.clone());
++            }
++        }
++        *props = ordered;
++    }
++    obj.insert("required".to_string(), json!(["command"]));
++}
++
+ fn flatten_tools(tools: &[Value]) -> Vec<Value> {
+     let mut flat = Vec::new();
+     for tool in tools {
+@@ -1036,6 +1075,9 @@ pub fn transform_openai_request(
+ 
+                     // 递归转换 type 为大写 (符合 Protobuf 定义)
+                     enforce_uppercase_types(params);
++                    if let Some(name) = name_opt.as_deref() {
++                        sanitize_shell_command_schema(name, params);
++                    }
+                 } else {
+                     gemini_func.as_object_mut().unwrap().insert(
+                         "parameters".to_string(),
+@@ -1673,7 +1715,12 @@ mod tests {
+     fn test_issue_2167_gemini_flash_thinking_signature() {
+         // Unsigned Flash functionCalls stay unsigned. A fake sentinel is
+         // rejected by Antigravity as Invalid thought signature.
+-        for model in &["gemini-3-flash", "gemini-3.1-flash"] {
++        for model in &[
++            "gemini-3-flash",
++            "gemini-3.1-flash",
++            "gemini-3.7-flash-high",
++            "gemini-3.8-flash-high",
++        ] {
+             let req = OpenAIRequest {
+                 model: model.to_string(),
+                 messages: vec![OpenAIMessage {
+@@ -1899,4 +1946,66 @@ mod tests {
+             "v1internal should avoid mixed Google Search when functionDeclarations present"
+         );
+     }
++
++    #[test]
++    fn test_bash_schema_required_command_only() {
++        let req = OpenAIRequest {
++            model: "gemini-3.7-flash-high".to_string(),
++            messages: vec![OpenAIMessage {
++                role: "user".to_string(),
++                refusal: None,
++                content: Some(OpenAIContent::String("run ls".to_string())),
++                reasoning_content: None,
++                tool_calls: None,
++                tool_call_id: None,
++                name: None,
++            }],
++            tools: Some(vec![json!({
++                "type": "function",
++                "function": {
++                    "name": "bash",
++                    "description": "Execute a bash command",
++                    "parameters": {
++                        "type": "object",
++                        "properties": {
++                            "description": {
++                                "type": "string",
++                                "description": "UI label"
++                            },
++                            "command": {
++                                "type": "string",
++                                "description": "The bash command to execute."
++                            },
++                            "timeoutMs": { "type": "number" }
++                        },
++                        "required": ["command", "description"]
++                    }
++                }
++            })]),
++            ..Default::default()
++        };
++
++        let (result, _, _, _) =
++            transform_openai_request(&req, "proj", "gemini-3.7-flash-high", None);
++        let decls = result["request"]["tools"][0]["functionDeclarations"]
++            .as_array()
++            .expect("functionDeclarations");
++        let bash = decls
++            .iter()
++            .find(|d| d["name"] == "bash")
++            .expect("bash declaration");
++        assert_eq!(
++            bash["parameters"]["required"],
++            json!(["command"]),
++            "Gemini must see command as the only required bash field"
++        );
++        let keys: Vec<String> = bash["parameters"]["properties"]
++            .as_object()
++            .expect("properties")
++            .keys()
++            .cloned()
++            .collect();
++        assert_eq!(keys.first().map(String::as_str), Some("command"));
++        assert!(bash["parameters"]["properties"].get("description").is_some());
++    }
+ }
+diff --git a/src-tauri/src/proxy/opencode_sync.rs b/src-tauri/src/proxy/opencode_sync.rs
+index 9a06234..c5e666e 100644
+--- a/src-tauri/src/proxy/opencode_sync.rs
++++ b/src-tauri/src/proxy/opencode_sync.rs
+@@ -106,7 +106,9 @@ fn build_model_catalog() -> Vec<ModelDef> {
+         reasoning: family.reasoning,
+         variant_type: match family.canonical_id {
+             "gemini-3.1-pro" => Some(VariantType::Gemini3Pro),
+-            "gemini-3.5-flash" => Some(VariantType::Gemini3Flash),
++            "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.5-flash" => {
++                Some(VariantType::Gemini3Flash)
++            }
+             _ => None,
+         },
+     }));
+@@ -1978,7 +1980,7 @@ mod tests {
+                 "gemini-3.1-pro" => {
+                     assert!(matches!(model.variant_type, Some(VariantType::Gemini3Pro)));
+                 }
+-                "gemini-3.5-flash" => {
++                "gemini-3.8-flash" | "gemini-3.7-flash" | "gemini-3.5-flash" => {
+                     assert!(matches!(
+                         model.variant_type,
+                         Some(VariantType::Gemini3Flash)
+@@ -3115,6 +3117,33 @@ mod canonical_family_tests {
+         assert_eq!(
+             families,
+             vec![
++                CanonicalFamilyDto {
++                    canonical_id: "gemini-3.8-flash".to_string(),
++                    display_name: "Gemini 3.8 Flash".to_string(),
++                    match_ids: vec![
++                        "gemini-3.8-flash".to_string(),
++                        "gemini-3.8-flash-high".to_string(),
++                        "gemini-3.8-flash-medium".to_string(),
++                        "gemini-3.8-flash-low".to_string(),
++                        "gemini-3.8-flash-tiered".to_string(),
++                    ],
++                },
++                CanonicalFamilyDto {
++                    canonical_id: "gemini-3.7-flash".to_string(),
++                    display_name: "Gemini 3.7 Flash".to_string(),
++                    match_ids: vec![
++                        "gemini-3.7-flash".to_string(),
++                        "gemini-3.7-flash-high".to_string(),
++                        "gemini-3.7-flash-medium".to_string(),
++                        "gemini-3.7-flash-low".to_string(),
++                        "gemini-3.7-flash-tiered".to_string(),
++                        "gemini-3.6-flash-high".to_string(),
++                        "gemini-3.6-flash-medium".to_string(),
++                        "gemini-3.6-flash-low".to_string(),
++                        "gemini-3.6-flash".to_string(),
++                        "gemini-3.6-flash-tiered".to_string(),
++                    ],
++                },
+                 CanonicalFamilyDto {
+                     canonical_id: "gemini-3.5-flash".to_string(),
+                     display_name: "Gemini 3.5 Flash".to_string(),
+diff --git a/src-tauri/src/proxy/rate_limit.rs b/src-tauri/src/proxy/rate_limit.rs
+index d425bf2..acdeb80 100644
+--- a/src-tauri/src/proxy/rate_limit.rs
++++ b/src-tauri/src/proxy/rate_limit.rs
+@@ -1,6 +1,20 @@
+ use dashmap::DashMap;
+ use regex::Regex;
+-use std::time::{Duration, SystemTime};
++use std::collections::VecDeque;
++use std::sync::Mutex;
++use std::time::{Duration, Instant, SystemTime};
++
++/// Local pre-Google pacing: stay under consumer RPM so we never poke
++/// RESOURCE_EXHAUSTED. 10/min + 2s spacing is below typical Antigravity
++/// consumer bursts; after a real 429 we lock 75s (Google's window is 60s).
++const PACE_WINDOW: Duration = Duration::from_secs(60);
++const PACE_MAX_RPM: usize = 10;
++const PACE_MIN_INTERVAL: Duration = Duration::from_millis(2000);
++const RPM_TRIP_LOCKOUT_SECS: u64 = 75;
++
++struct PaceWindow {
++    sends: VecDeque<Instant>,
++}
+ 
+ /// 限流原因类型
+ #[derive(Debug, Clone, Copy, PartialEq)]
+@@ -46,6 +60,8 @@ pub struct RateLimitTracker {
+     limits: DashMap<String, RateLimitInfo>,
+     /// 连续失败计数（用于智能指数退避），带时间戳用于自动过期
+     failure_counts: DashMap<String, (u32, SystemTime)>,
++    /// Per-account sliding window of dispatches we already sent upstream.
++    pace: DashMap<String, Mutex<PaceWindow>>,
+ }
+ 
+ impl RateLimitTracker {
+@@ -53,6 +69,7 @@ impl RateLimitTracker {
+         Self {
+             limits: DashMap::new(),
+             failure_counts: DashMap::new(),
++            pace: DashMap::new(),
+         }
+     }
+ 
+@@ -67,14 +84,15 @@ impl RateLimitTracker {
+     }
+ 
+     /// 获取账号剩余的等待时间(秒)
+-    /// 支持检查账号级和模型级锁
++    /// 支持检查账号级和模型级锁，并叠加本地上游节奏（未打到 Google 的预限流）。
+     pub fn get_remaining_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
+         let now = SystemTime::now();
++        let mut wait = 0u64;
+ 
+         // 1. 检查全局账号锁
+         if let Some(info) = self.limits.get(account_id) {
+             if info.reset_time > now {
+-                return info
++                wait = info
+                     .reset_time
+                     .duration_since(now)
+                     .unwrap_or(Duration::from_secs(0))
+@@ -87,16 +105,82 @@ impl RateLimitTracker {
+             let key = self.get_limit_key(account_id, Some(m));
+             if let Some(info) = self.limits.get(&key) {
+                 if info.reset_time > now {
+-                    return info
+-                        .reset_time
+-                        .duration_since(now)
+-                        .unwrap_or(Duration::from_secs(0))
+-                        .as_secs();
++                    wait = wait.max(
++                        info.reset_time
++                            .duration_since(now)
++                            .unwrap_or(Duration::from_secs(0))
++                            .as_secs(),
++                    );
++                }
++            }
++        }
++
++        wait.max(self.pace_wait_secs(account_id))
++    }
++
++    fn lock_mutex<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
++        m.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    fn prune_pace(sends: &mut VecDeque<Instant>, now: Instant) {
++        while sends
++            .front()
++            .map(|t| now.duration_since(*t) >= PACE_WINDOW)
++            .unwrap_or(false)
++        {
++            sends.pop_front();
++        }
++    }
++
++    /// Seconds until this account may send another request to Google.
++    /// Combines min-interval and sliding RPM. 0 means the next call is allowed.
++    pub fn pace_wait_secs(&self, account_id: &str) -> u64 {
++        let now = Instant::now();
++        let Some(entry) = self.pace.get(account_id) else {
++            return 0;
++        };
++        let mut window = Self::lock_mutex(entry.value());
++        Self::prune_pace(&mut window.sends, now);
++
++        let mut wait = Duration::ZERO;
++        if let Some(last) = window.sends.back() {
++            if let Some(remain) = PACE_MIN_INTERVAL.checked_sub(now.duration_since(*last)) {
++                wait = remain;
++            }
++        }
++        if window.sends.len() >= PACE_MAX_RPM {
++            if let Some(oldest) = window.sends.front() {
++                let until = *oldest + PACE_WINDOW;
++                if until > now {
++                    wait = wait.max(until.saturating_duration_since(now));
+                 }
+             }
+         }
++        if wait.is_zero() {
++            0
++        } else {
++            wait.as_secs().max(1)
++        }
++    }
+ 
+-        0
++    /// Record that we are about to hit Google with this account.
++    pub fn record_dispatch(&self, account_id: &str) {
++        let now = Instant::now();
++        let entry = self.pace.entry(account_id.to_string()).or_insert_with(|| {
++            Mutex::new(PaceWindow {
++                sends: VecDeque::new(),
++            })
++        });
++        let mut window = Self::lock_mutex(entry.value());
++        Self::prune_pace(&mut window.sends, now);
++        window.sends.push_back(now);
++        tracing::info!(
++            "[Upstream-Pace] account {} dispatch {}/{} in 60s (min interval {}ms)",
++            account_id,
++            window.sends.len(),
++            PACE_MAX_RPM,
++            PACE_MIN_INTERVAL.as_millis()
++        );
+     }
+ 
+     /// 标记账号请求成功，重置连续失败计数
+@@ -315,14 +399,15 @@ impl RateLimitTracker {
+                         lockout
+                     }
+                     RateLimitReason::RateLimitExceeded => {
+-                        // 速率限制 (TPM/RPM)
++                        // 速率限制 (TPM/RPM)。Google 窗口是 60s；锁 30s 会在窗口还热时
++                        // 立刻再打上去，把 429 续上。锁满一个窗口再加余量。
+                         let body_lower = body.to_lowercase();
+                         let lockout = if body_lower.contains("resource has been exhausted")
+                             || body_lower.contains("resource_exhausted")
+                         {
+-                            30
++                            RPM_TRIP_LOCKOUT_SECS
+                         } else {
+-                            5
++                            15
+                         };
+                         tracing::debug!(
+                             "检测到速率限制 (RATE_LIMIT_EXCEEDED)，使用默认值 {}秒",
+@@ -820,4 +905,51 @@ mod tests {
+         let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
+         assert_eq!(info.unwrap().retry_after_sec, 7200);
+     }
++
++    #[test]
++    fn test_upstream_pace_min_interval_blocks_second_dispatch() {
++        let tracker = RateLimitTracker::new();
++        assert_eq!(tracker.pace_wait_secs("acc-pace"), 0);
++        tracker.record_dispatch("acc-pace");
++        let wait = tracker.pace_wait_secs("acc-pace");
++        assert!(
++            wait >= 1,
++            "second dispatch inside min interval must wait, got {wait}"
++        );
++        assert!(tracker.is_rate_limited("acc-pace", None));
++    }
++
++    #[test]
++    fn test_upstream_pace_rpm_cap() {
++        let tracker = RateLimitTracker::new();
++        for _ in 0..PACE_MAX_RPM {
++            tracker.record_dispatch("acc-rpm");
++        }
++        let wait = tracker.pace_wait_secs("acc-rpm");
++        assert!(
++            wait >= 1,
++            "dispatch after RPM cap must wait for the 60s window, got {wait}"
++        );
++    }
++
++    #[test]
++    fn test_resource_exhausted_lockout_covers_google_minute_window() {
++        let tracker = RateLimitTracker::new();
++        let body = r#"{
++            "error": {
++                "code": 429,
++                "message": "Resource has been exhausted (e.g. check quota).",
++                "status": "RESOURCE_EXHAUSTED"
++            }
++        }"#;
++        let info = tracker
++            .parse_from_error("acc-rpm-trip", 429, None, body, None, &[])
++            .expect("lockout");
++        assert_eq!(info.retry_after_sec, RPM_TRIP_LOCKOUT_SECS);
++        let wait = tracker.get_remaining_wait("acc-rpm-trip", None);
++        assert!(
++            wait >= 70 && wait <= RPM_TRIP_LOCKOUT_SECS,
++            "lockout should cover Google's 60s RPM window, got {wait}"
++        );
++    }
+ }
+diff --git a/src-tauri/src/proxy/token_manager.rs b/src-tauri/src/proxy/token_manager.rs
+index 66c35a5..f48d9f1 100644
+--- a/src-tauri/src/proxy/token_manager.rs
++++ b/src-tauri/src/proxy/token_manager.rs
+@@ -2032,6 +2032,8 @@ impl TokenManager {
+                 }
+             }
+ 
++            self.rate_limit_tracker.record_dispatch(&token.account_id);
++
+             return Ok((
+                 token.access_token,
+                 project_id,
+@@ -2268,20 +2270,20 @@ impl TokenManager {
+ 
+     /// 检查账号是否在限流中 (支持模型级)
+     pub async fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
+-        // [NEW] 检查熔断是否启用
++        // Circuit breaker can disable *reactive* 429 locks, but local upstream
++        // pacing must still run so we do not keep hitting Google.
+         let config = self.circuit_breaker_config.read().await;
+         if !config.enabled {
+-            return false;
++            return self.rate_limit_tracker.pace_wait_secs(account_id) > 0;
+         }
+         self.rate_limit_tracker.is_rate_limited(account_id, model)
+     }
+ 
+     /// [NEW] 检查账号是否在限流中 (同步版本，仅用于 Iterator)
+     pub fn is_rate_limited_sync(&self, account_id: &str, model: Option<&str>) -> bool {
+-        // 同步版本无法读取 async RwLock，这里使用 blocking_read
+         let config = self.circuit_breaker_config.blocking_read();
+         if !config.enabled {
+-            return false;
++            return self.rate_limit_tracker.pace_wait_secs(account_id) > 0;
+         }
+         self.rate_limit_tracker.is_rate_limited(account_id, model)
+     }

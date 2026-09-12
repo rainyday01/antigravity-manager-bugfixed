@@ -2,8 +2,8 @@
 
 > **This is a community patched snapshot, not the upstream project.**
 >
-> Based on [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) **v4.5.6**. The only functional changes are Gemini 3.x `thought_signature` handling.
-> Upstream **v4.5.7** absorbed the “missing signature” fix but still injects a skip sentinel and reuses the latest session signature. Upstream **v4.5.8** still does not fix `Invalid thought signature`. This tree therefore stays on 4.5.6 + the local patch instead of tracking `latest`.
+> Based on [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) **v4.5.6**. Working tree = upstream + local P0–P5 (`thought_signature`, OpenAI passthrough, bash schema, Gemini 3.8 Flash, upstream pacing, SDK identity).
+> Upstream **v4.5.7** absorbed the “missing signature” fix but still injects a skip sentinel and reuses the latest session signature. Upstream **v4.7.1** (2026-09-12) still does not fix `Invalid thought signature`. This tree therefore stays on 4.5.6 + the local patches instead of tracking `latest`.
 >
 > Read [WHY-WE-PATCH.md](./WHY-WE-PATCH.md) first (Chinese). `install.sh` / Casks in this tree still download **unpatched official** installers. To get the patch, build from source.
 >

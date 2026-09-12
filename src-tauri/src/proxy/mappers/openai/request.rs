@@ -112,6 +112,45 @@ fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str) -> String
     format!("{}__{}", ns, child)
 }
 
+/// DSH/Codex shell tools mark both `command` and `description` as required.
+/// Gemini 3.x then often fills the natural-language `description` slot and
+/// omits `command`, which the client rejects (`missing required property
+/// "command"`). Keep `command` required and first; leave UI `description`
+/// optional so Gemini can still send it.
+fn sanitize_shell_command_schema(tool_name: &str, params: &mut Value) {
+    let is_shell = matches!(
+        tool_name,
+        "bash" | "shell" | "local_shell" | "local_shell_call"
+    );
+    if !is_shell {
+        return;
+    }
+    let Some(obj) = params.as_object_mut() else {
+        return;
+    };
+    let has_command = obj
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|p| p.contains_key("command"))
+        .unwrap_or(false);
+    if !has_command {
+        return;
+    }
+    if let Some(Value::Object(props)) = obj.get_mut("properties") {
+        let mut ordered = serde_json::Map::new();
+        if let Some(cmd) = props.get("command").cloned() {
+            ordered.insert("command".to_string(), cmd);
+        }
+        for (k, v) in props.iter() {
+            if k != "command" {
+                ordered.insert(k.clone(), v.clone());
+            }
+        }
+        *props = ordered;
+    }
+    obj.insert("required".to_string(), json!(["command"]));
+}
+
 fn flatten_tools(tools: &[Value]) -> Vec<Value> {
     let mut flat = Vec::new();
     for tool in tools {
@@ -1036,6 +1075,9 @@ pub fn transform_openai_request(
 
                     // 递归转换 type 为大写 (符合 Protobuf 定义)
                     enforce_uppercase_types(params);
+                    if let Some(name) = name_opt.as_deref() {
+                        sanitize_shell_command_schema(name, params);
+                    }
                 } else {
                     gemini_func.as_object_mut().unwrap().insert(
                         "parameters".to_string(),
@@ -1673,7 +1715,12 @@ mod tests {
     fn test_issue_2167_gemini_flash_thinking_signature() {
         // Unsigned Flash functionCalls stay unsigned. A fake sentinel is
         // rejected by Antigravity as Invalid thought signature.
-        for model in &["gemini-3-flash", "gemini-3.1-flash"] {
+        for model in &[
+            "gemini-3-flash",
+            "gemini-3.1-flash",
+            "gemini-3.7-flash-high",
+            "gemini-3.8-flash-high",
+        ] {
             let req = OpenAIRequest {
                 model: model.to_string(),
                 messages: vec![OpenAIMessage {
@@ -1898,5 +1945,67 @@ mod tests {
             !has_google_search,
             "v1internal should avoid mixed Google Search when functionDeclarations present"
         );
+    }
+
+    #[test]
+    fn test_bash_schema_required_command_only() {
+        let req = OpenAIRequest {
+            model: "gemini-3.7-flash-high".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                refusal: None,
+                content: Some(OpenAIContent::String("run ls".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            tools: Some(vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Execute a bash command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "type": "string",
+                                "description": "UI label"
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "The bash command to execute."
+                            },
+                            "timeoutMs": { "type": "number" }
+                        },
+                        "required": ["command", "description"]
+                    }
+                }
+            })]),
+            ..Default::default()
+        };
+
+        let (result, _, _, _) =
+            transform_openai_request(&req, "proj", "gemini-3.7-flash-high", None);
+        let decls = result["request"]["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("functionDeclarations");
+        let bash = decls
+            .iter()
+            .find(|d| d["name"] == "bash")
+            .expect("bash declaration");
+        assert_eq!(
+            bash["parameters"]["required"],
+            json!(["command"]),
+            "Gemini must see command as the only required bash field"
+        );
+        let keys: Vec<String> = bash["parameters"]["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(keys.first().map(String::as_str), Some("command"));
+        assert!(bash["parameters"]["properties"].get("description").is_some());
     }
 }

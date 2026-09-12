@@ -2,14 +2,14 @@
 
 本仓库是 [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) **v4.5.6** 的修补快照，不是官方发行渠道，也不是官方镜像的替代发布站。
 
-我们只改了 Claude / Gemini / OpenAI 三条协议映射里 `thought_signature` 的处理。上游版权仍是官方的 **CC-BY-NC-SA-4.0**（本仓库的 `LICENSE` 已改回官方协议，覆盖 GitHub 建仓时的默认 MIT）。
+功能改动集中在协议映射：Gemini 3.x `thought_signature`、bash schema、3.8 Flash 变体、上游节奏限制、Claude Agent SDK 身份归一。上游版权仍是官方的 **CC-BY-NC-SA-4.0**（本仓库的 `LICENSE` 已改回官方协议，覆盖 GitHub 建仓时的默认 MIT）。
 
 ## 本仓库包含什么 / 不包含什么
 
 **包含**
 
 - 官方 v4.5.6 源码快照（tag `v4.5.6`，commit `a2e3c45`）
-- 当前生效的协议层补丁（工作树 = v4.5.6 + P0 + P1；P0 含 Flash 家族泛化并撤销哨兵；P1 补 OpenAI 兼容层签名透传）
+- 当前生效的协议层补丁（工作树 = v4.5.6 + P0–P5）
 - 补丁文件：`patches/`
 - 可选的 Debian bookworm 后端构建文件：`docker/Dockerfile.backend.slim`
 
@@ -173,31 +173,81 @@ P1 做了三件事：
 2. **请求侧按条回放**：客户端带回的字段 → `get_tool_signature(tool_id)` → `get_session_signature_at(session, msg_index)` → 同一条 assistant 消息里已绑定的签名。仍然 **不用** `get_session_signature()` latest，也 **不** 注入 skip 哨兵。
 3. **回放缓存 TTL**：tool / session 签名从 2 小时改为 **7 天**（family cache 仍是 2 小时）。
 
-当前工作树 = **官方 v4.5.6 + P0 + P1**。
+当前工作树在 P1 之后还有 P2–P5（见下一节）。合在一起 = **官方 v4.5.6 + P0 + P1 + P2 + P3 + P4 + P5**。
+
+---
+
+## 4.2 第四轮 P2：bash schema 只把 `command` 标成必填
+
+补丁：`patches/followups-p2-p5.patch`（相对本仓库 P1 快照；同一文件里也含 P3–P5）。
+
+DSH / Codex 的 `bash` / `shell` 工具把 `command` **和** `description` 都标成 `required`。Gemini 3.x 经常只填自然语言 `description`、漏掉真正可执行的 `command`，下游就报 `missing required property "command"`。
+
+本仓库的做法是在发给 Gemini 之前改 schema：
+
+- `required` 只保留 `["command"]`
+- `properties` 里把 `command` 排到第一位
+- `description` 仍可发送，但不再是必填
+
+官方 **v4.7.1** 走另一条路（Issue #3430）：模型已经漏参之后，用 `description` 拼一条 `echo "[OK: Action logged - ...]"` 塞进 `command`。那能挡住下游崩溃，但会把「没真正执行」伪装成成功。我们不采用这条。
+
+---
+
+## 4.3 第五轮 P3：Gemini 3.8 Flash 变体 + 跨 3.x Flash 签名家族
+
+官方到 v4.7.1 有 3.5 / 3.6 / 3.7 Flash 变体，**没有** 3.8 Flash 的 `variant_mapping`。本仓库补上 3.8（以及 4.5.6 基线没有的 3.7）low / medium / high / tiered，并让 sanitizer 把 Gemini 3.x Flash 签名当成同一家族：3.7-flash-high 上拿到的签名，切到 3.8-flash-high 时不要当成 family miss（family miss 在官方路径上会剥 thinking，随后盖 latest / skip，又变成 Invalid）。
+
+---
+
+## 4.4 第六轮 P4：网关侧上游节奏限制
+
+单账号打 Google 过猛会先吃 `429 RESOURCE_EXHAUSTED`，再被网关映射成对客户端的 503 `overloaded_error`。官方 4.7.1 做的是**事后**分类：没有 `quotaResetTimeStamp` 的 429 当成短时 `RateLimitExceeded`，避免误锁 30 分钟。那挡不住「先打到 429」。
+
+本仓库在 `get_token` 成功后 `record_dispatch`，按账号做：
+
+- 滑动窗口最多 **10 次 / 60s**
+- 两次调度最少间隔 **2s**
+- 真的收到 `RESOURCE_EXHAUSTED` 后锁 **75s**（Google 窗口约 60s）
+
+熔断器关掉时，官方会直接跳过限流检查；本仓库仍执行本地节奏，避免关熔断后把账号打爆。
+
+---
+
+## 4.5 第七轮 P5：Claude Agent SDK 身份归一成 CLI
+
+Claude Agent SDK / Codex 走 Anthropic 协议时会带独立身份句：
+
+`You are a Claude agent, built on Anthropic's Claude Agent SDK.`
+
+Antigravity 上游把这句话和 Claude Code CLI 身份当成不同产品线，同样的请求可能直接 `RESOURCE_EXHAUSTED`。P5 只在**整段文本精确相等**时改写成 CLI 身份；用户自己写的「Compatibility note: …」不会被改。
+
+官方 **v4.5.8** 已经有同样的函数。我们停在 4.5.6，所以要把这条自己补上。不是签名修复，是 503 身份分流。
 
 ---
 
 ## 5. 对照官方版本：为什么先不升级
 
-核查日期：2026-08-22。官方最新 tag 当时是 **v4.5.8**。
+核查日期：2026-09-12。官方最新 tag 是 **v4.7.1**（commit `734e2bd`）。
 
-| 官方版本 | 发布 | 和 thought_signature 的关系 | 能不能当本补丁的替代 |
+| 官方版本 | 发布 | 和本仓库补丁的关系 | 能不能当本补丁的替代 |
 |---|---|---|---|
 | **v4.5.6** | 2026-08-15 | 本仓库基线。Flash 白名单写死 3 / 3.1 | 基线 |
-| **v4.5.7** | 2026-08-20 | [PR #3314](https://github.com/lbjlaq/Antigravity-Manager/pull/3314) 吸收第一轮（Flash 泛化 **+ 哨兵兜底**）。另有账号 5H/周配额视图、智能预热，与签名无关 | **不能**。哨兵正是 Invalid 的来源之一 |
-| **v4.5.8** | 2026-08-22 | [PR #3316](https://github.com/lbjlaq/Antigravity-Manager/pull/3316) 只做 Claude Agent SDK / CC GUI 身份归一（修 503 `RESOURCE_EXHAUSTED`），与签名无关 | **不能** |
+| **v4.5.7** | 2026-08-20 | [PR #3314](https://github.com/lbjlaq/Antigravity-Manager/pull/3314) 吸收第一轮（Flash 泛化 **+ 哨兵兜底**） | **不能**。哨兵正是 Invalid 的来源之一 |
+| **v4.5.8** | 2026-08-22 | [PR #3316](https://github.com/lbjlaq/Antigravity-Manager/pull/3316) Claude Agent SDK 身份归一（= 本仓库 P5） | **不能**。签名路径未改 |
+| **v4.6.x** | 2026-08–09 | 会话隔离、Retry-After、schema `array.items` 兜底、Flash 思考档位等。签名路径仍是 skip / latest | **不能** |
+| **v4.7.1** | 2026-09-12 | 按需 `requestType: agent`、429 细分类、bash 漏参后 echo 占位、3.7 Flash 变体。**仍注入哨兵，仍 latest 复用，仍 cache miss 丢 thinking。没有 3.8 Flash 变体。** | **不能** |
 
-v4.5.8 源码抽查（官方 tag，不是 changelog）：
+v4.7.1 源码抽查（官方 tag，不是 changelog）：
 
 - `thinking_utils.rs` 仍是 `Dropping unverified signature (cache miss after restart)`
-- `claude/request.rs` 仍有 `Recovered latest signature from SESSION cache`，仍注入 `skip_thought_signature_validator`
+- `claude/request.rs` 仍注入 `skip_thought_signature_validator`，仍 `get_session_signature()` latest
 - `gemini/wrapper.rs` 对 Flash 仍注入 latest 或 skip 哨兵
+- `openai/request.rs` 无签名时仍注入 skip 哨兵
+- `variant_mapping.rs` 有 3.5 / 3.6 / 3.7 Flash，没有 3.8
 
-因此：把运行中的镜像换成官方 `latest` / `v4.5.8`，第一轮还在，**第二轮会退回去**，`Invalid thought signature` 会再现。
+因此：把运行中的镜像换成官方 `latest` / `v4.7.1`，第一轮还在，**P0 会退回去**，`Invalid thought signature` 会再现。官方 4.6/4.7 的会话隔离、按需 Agent 通道、原子写盘等是真改进，但目前不值得用签名回退去换。
 
-v4.5.8 的 503 修复只影响 Claude Agent SDK / CC GUI 那种独立身份声明（`"You are a Claude agent, built on Anthropic's Claude Agent SDK."`）。Claude Code CLI 本身已经是官方 CLI 身份，吃不到这条。配额视图、智能预热也不值得为此回退签名修复。
-
-正确的升级方式（以后若要做）：把 P0 **rebase 到官方新 tag**，再编译，而不是直接拉官方镜像。
+正确的升级方式（以后若要做）：把 P0–P4 **rebase 到官方新 tag**（P5 已在 4.5.8+），再编译，而不是直接拉官方镜像。
 
 ---
 
@@ -209,7 +259,7 @@ v4.5.8 的 503 修复只影响 Claude Agent SDK / CC GUI 那种独立身份声�
 antigravity-manager:local-4.5.6-sigfix
 ```
 
-不要把本仓库描述成「官方 4.5.6」。它是 **4.5.6 + thought_signature P0 + OpenAI P1**。
+不要把本仓库描述成「官方 4.5.6」。它是 **4.5.6 + P0–P5**（签名、OpenAI 透传、bash schema、3.8 Flash、上游节奏、SDK 身份）。
 
 ---
 
@@ -237,7 +287,7 @@ cargo test --lib skip_thought_signature_validator
 cargo test --lib openai_replays_client
 ```
 
-官方原有测试里有「应当注入哨兵」的用例，P0 已改成「不得注入哨兵」。P1 另有客户端回放 / tool-id 缓存测试。
+官方原有测试里有「应当注入哨兵」的用例，P0 已改成「不得注入哨兵」。P1 另有客户端回放 / tool-id 缓存测试。P2 有 bash `required: ["command"]` 测试。P5 有 SDK 身份整段替换 / 引用不替换测试。
 
 ---
 
@@ -250,7 +300,7 @@ cargo test --lib openai_replays_client
 3. 官方 **不再**注入 `skip_thought_signature_validator`（至少在 Antigravity `agent` / Gemini 3.x Flash 路径上）
 4. changelog 或 issue 明确覆盖 `Invalid thought signature`，而不只是 `missing a thought_signature`
 
-在此之前，本仓库停留在 **v4.5.6 + P0**。
+在此之前，本仓库停留在 **v4.5.6 + P0–P5**。官方 4.6/4.7 的非签名改进（按需 `requestType`、会话隔离、Retry-After 等）以后 rebase 时再考虑吸收。
 
 ---
 
@@ -261,12 +311,15 @@ cargo test --lib openai_replays_client
 | `patches/thought-signature-gemini-3.7.patch` | 第一轮历史补丁（缺签名 / Flash 白名单）。不要再 apply 到当前树 |
 | `patches/thought-signature-invalid-p0.patch` | 第二轮 P0，相对官方 v4.5.6 |
 | `patches/thought-signature-openai-p1.patch` | 第三轮 P1，相对本仓库 P0 快照：OpenAI 签名透传 + 7 天回放缓存 |
+| `patches/followups-p2-p5.patch` | 第四–七轮，相对本仓库 P1 快照：bash schema、3.8 Flash、上游节奏、SDK 身份 |
 | `patches/README.md` | 补丁使用说明 |
-| `src-tauri/src/proxy/mappers/claude/request.rs` | Claude → Gemini 签名绑定 |
-| `src-tauri/src/proxy/mappers/claude/thinking_utils.rs` | sanitizer：cache miss 保留 thinking |
+| `src-tauri/src/proxy/mappers/claude/request.rs` | Claude → Gemini 签名绑定 + SDK 身份归一 |
+| `src-tauri/src/proxy/mappers/claude/thinking_utils.rs` | sanitizer：cache miss 保留 thinking；3.x Flash 家族兼容 |
 | `src-tauri/src/proxy/mappers/gemini/wrapper.rs` | 原生 Gemini 包装：无签名则保持 unsigned |
-| `src-tauri/src/proxy/mappers/openai/request.rs` | OpenAI 请求：按 tool_call 回放签名 |
+| `src-tauri/src/proxy/mappers/openai/request.rs` | OpenAI 请求：按 tool_call 回放签名；bash schema 只必填 command |
 | `src-tauri/src/proxy/mappers/openai/streaming.rs` / `response.rs` / `collector.rs` / `models.rs` | OpenAI 响应把签名交给客户端 |
 | `src-tauri/src/proxy/signature_cache.rs` | tool/session 回放 TTL 7 天 |
+| `src-tauri/src/proxy/common/variant_mapping.rs` / `model_mapping.rs` | Gemini 3.7 / 3.8 Flash 变体 |
+| `src-tauri/src/proxy/rate_limit.rs` / `token_manager.rs` | 上游 10 RPM + 2s 间隔 + 75s 429 锁 |
 | `docker/Dockerfile.backend.slim` | 可选：bookworm 后端构建 |
 | `src-tauri/src/modules/oauth.rs` | 去掉上游硬编码 OAuth 常量，改环境变量（仅为了能推送到 GitHub） |

@@ -8,6 +8,24 @@ use crate::proxy::session_manager::SessionManager;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+const CLAUDE_AGENT_SDK_IDENTITY: &str =
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+const CLAUDE_CODE_CLI_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Normalize the standalone identity block injected by Claude Agent SDK clients.
+///
+/// Antigravity's upstream currently classifies this SDK identity differently from
+/// Claude Code's CLI identity and can reject an otherwise identical request with
+/// RESOURCE_EXHAUSTED. Keep the match exact so user-authored text that merely
+/// mentions the SDK identity is not rewritten.
+fn normalize_claude_client_identity(text: &str) -> &str {
+    if text == CLAUDE_AGENT_SDK_IDENTITY {
+        CLAUDE_CODE_CLI_IDENTITY
+    } else {
+        text
+    }
+}
+
 // ===== Safety Settings Configuration =====
 
 /// Safety threshold levels for Gemini API
@@ -935,13 +953,15 @@ fn build_system_instruction(
             SystemPrompt::String(text) => {
                 // [MODIFIED] No longer filter "You are an interactive CLI tool"
                 // We pass everything through to ensure Flash/Lite models get full instructions
-                parts.push(json!({"text": text}));
+                parts.push(json!({"text": normalize_claude_client_identity(text)}));
             }
             SystemPrompt::Array(blocks) => {
                 for block in blocks {
                     if block.block_type == "text" {
                         // [MODIFIED] No longer filter "You are an interactive CLI tool"
-                        parts.push(json!({"text": block.text}));
+                        parts.push(json!({
+                            "text": normalize_claude_client_identity(&block.text)
+                        }));
                     }
                 }
             }
@@ -2171,6 +2191,25 @@ fn is_model_compatible(cached: &str, target: &str) -> bool {
     if c.contains("gemini-2.0-pro") && t.contains("gemini-2.0-pro") {
         return true;
     }
+    // Gemini 3.x Flash signatures are interchangeable across 3 / 3.5 / 3.6 / 3.7 / 3.8
+    // patch versions. Reusing a 3.7-flash-high signature on 3.8-flash-high must not
+    // be treated as a family miss (that path used to stamp skip / latest and hit
+    // Invalid thought signature).
+    if c.contains("gemini-3") && t.contains("gemini-3") {
+        let c_flash = c.contains("flash");
+        let t_flash = t.contains("flash");
+        let c_pro = c.contains("pro");
+        let t_pro = t.contains("pro");
+        if c_flash == t_flash && c_pro == t_pro {
+            return true;
+        }
+        if c_flash && t_flash {
+            return true;
+        }
+        if c_pro && t_pro {
+            return true;
+        }
+    }
 
     // Fallback: strict match required
     false
@@ -2181,6 +2220,51 @@ mod tests {
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
     use crate::proxy::config::{update_thinking_budget_config, ThinkingBudgetConfig};
+
+    #[test]
+    fn test_agent_sdk_identity_is_normalized_for_antigravity() {
+        let req: ClaudeRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "Reply with ok"}],
+            "system": [
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_entrypoint=sdk-cli;"
+                },
+                {
+                    "type": "text",
+                    "text": CLAUDE_AGENT_SDK_IDENTITY,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+        }))
+        .expect("Agent SDK request should deserialize");
+
+        let body =
+            transform_claude_request_in(&req, "test-project", false, None, "test-session", None)
+                .expect("Agent SDK request should transform");
+        let system_parts = body["request"]["systemInstruction"]["parts"]
+            .as_array()
+            .expect("system instruction should contain parts");
+        let system_texts = system_parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(system_texts.contains(&CLAUDE_CODE_CLI_IDENTITY));
+        assert!(!system_texts.contains(&CLAUDE_AGENT_SDK_IDENTITY));
+        assert!(system_texts.contains(&"x-anthropic-billing-header: cc_entrypoint=sdk-cli;"));
+    }
+
+    #[test]
+    fn test_agent_sdk_identity_mention_is_not_rewritten() {
+        let quoted_identity = format!("Compatibility note: {CLAUDE_AGENT_SDK_IDENTITY}");
+
+        assert_eq!(
+            normalize_claude_client_identity(&quoted_identity),
+            quoted_identity
+        );
+    }
 
     #[test]
     fn test_ephemeral_injection_debug() {
@@ -3232,6 +3316,8 @@ mod tests {
         assert!(model_keeps_thinking_without_signature("gemini-3-flash"));
         assert!(model_keeps_thinking_without_signature("gemini-3.1-flash"));
         assert!(model_keeps_thinking_without_signature("gemini-3.7-flash-high"));
+        assert!(model_keeps_thinking_without_signature("gemini-3.8-flash-high"));
+        assert!(model_keeps_thinking_without_signature("gemini-3.8-flash"));
         assert!(model_keeps_thinking_without_signature(
             "gemini-3.6-flash-medium"
         ));
@@ -3240,6 +3326,23 @@ mod tests {
         assert!(!model_keeps_thinking_without_signature("gemini-3.1-pro"));
         assert!(!model_keeps_thinking_without_signature(
             "gemini-3.1-pro-preview"
+        ));
+    }
+
+    #[test]
+    fn test_gemini_3_flash_signatures_are_cross_version_compatible() {
+        assert!(is_model_compatible(
+            "gemini-3.7-flash-high",
+            "gemini-3.8-flash-high"
+        ));
+        assert!(is_model_compatible(
+            "gemini-3.8-flash-low",
+            "gemini-3.5-flash-low"
+        ));
+        assert!(is_model_compatible("gemini-3-flash", "gemini-3.8-flash"));
+        assert!(!is_model_compatible(
+            "gemini-3.8-flash-high",
+            "gemini-3.1-pro-high"
         ));
     }
 }

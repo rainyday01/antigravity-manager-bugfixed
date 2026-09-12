@@ -2032,6 +2032,8 @@ impl TokenManager {
                 }
             }
 
+            self.rate_limit_tracker.record_dispatch(&token.account_id);
+
             return Ok((
                 token.access_token,
                 project_id,
@@ -2268,20 +2270,20 @@ impl TokenManager {
 
     /// 检查账号是否在限流中 (支持模型级)
     pub async fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
-        // [NEW] 检查熔断是否启用
+        // Circuit breaker can disable *reactive* 429 locks, but local upstream
+        // pacing must still run so we do not keep hitting Google.
         let config = self.circuit_breaker_config.read().await;
         if !config.enabled {
-            return false;
+            return self.rate_limit_tracker.pace_wait_secs(account_id) > 0;
         }
         self.rate_limit_tracker.is_rate_limited(account_id, model)
     }
 
     /// [NEW] 检查账号是否在限流中 (同步版本，仅用于 Iterator)
     pub fn is_rate_limited_sync(&self, account_id: &str, model: Option<&str>) -> bool {
-        // 同步版本无法读取 async RwLock，这里使用 blocking_read
         let config = self.circuit_breaker_config.blocking_read();
         if !config.enabled {
-            return false;
+            return self.rate_limit_tracker.pace_wait_secs(account_id) > 0;
         }
         self.rate_limit_tracker.is_rate_limited(account_id, model)
     }
